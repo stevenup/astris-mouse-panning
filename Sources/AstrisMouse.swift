@@ -46,9 +46,8 @@ struct AMConfig {
         "f15": 113, "f4": 118, "f2": 120, "f1": 122,
     ]
 
-    static func load() -> AMConfig {
+    static func load(env: [String: String] = ProcessInfo.processInfo.environment) -> AMConfig {
         var c = AMConfig()
-        let env = ProcessInfo.processInfo.environment
         func num(_ key: String) -> Double? {
             env[key].flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
         }
@@ -88,6 +87,53 @@ struct AMConfig {
             }
         }
         return c
+    }
+
+    // 解析 config.env 文本：支持 `export KEY=VALUE`、引号、行尾注释；只认 ASTRIS_MOUSE_* 键
+    static func parseEnvFile(_ text: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            var line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            if line.hasPrefix("export ") {
+                line = line.dropFirst(7).trimmingCharacters(in: .whitespaces)
+            }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            guard key.hasPrefix("ASTRIS_MOUSE_") else { continue }
+            var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            if let quote = value.first, quote == "\"" || quote == "'" {
+                let body = value.dropFirst()
+                value = String(body[..<(body.firstIndex(of: quote) ?? body.endIndex)])
+            } else if let end = value.firstIndex(where: { $0 == " " || $0 == "\t" || $0 == "#" }) {
+                value = String(value[..<end])
+            }
+            out[key] = value
+        }
+        return out
+    }
+
+    var summary: String {
+        "toggle=\(toggleDescription) fullSpeed=\(fullSpeed)pt/s curve=\(curve) smoothing=\(Int(smoothingTau * 1000))ms window=\(Int(window * 1000))ms antiDeadzone=\(antiDeadzone) outputDeadzone=\(outputDeadzone) invertY=\(invertY) controller=\(controllerOverride.map(String.init) ?? "auto") takeover=\(takeover) sound=\(sound) debug=\(debug)"
+    }
+
+    func changes(from old: AMConfig) -> [String] {
+        var out: [String] = []
+        func cmp<T: Equatable>(_ name: String, _ a: T, _ b: T) {
+            if a != b { out.append("\(name) \(a)→\(b)") }
+        }
+        cmp("fullSpeed", old.fullSpeed, fullSpeed)
+        cmp("curve", old.curve, curve)
+        cmp("smoothingMs", Int(old.smoothingTau * 1000), Int(smoothingTau * 1000))
+        cmp("windowMs", Int(old.window * 1000), Int(window * 1000))
+        cmp("antiDeadzone", old.antiDeadzone, antiDeadzone)
+        cmp("outputDeadzone", old.outputDeadzone, outputDeadzone)
+        cmp("invertY", old.invertY, invertY)
+        cmp("toggle", old.toggleDescription, toggleDescription)
+        cmp("controller", old.controllerOverride.map(String.init) ?? "auto", controllerOverride.map(String.init) ?? "auto")
+        cmp("sound", old.sound, sound)
+        cmp("debug", old.debug, debug)
+        return out
     }
 }
 
@@ -305,12 +351,24 @@ final class AMState {
     static let shared = AMState()
 
     let lock = NSLock()
-    let cfg: AMConfig
+    // 主线程直接读写；其他线程读取时先拿 lock 拷一份
+    var cfg: AMConfig
     var bindings: AMBindings
+
+    // config.env 热更新：首次收到文件内容时，把启动环境里不是来自文件的键记为命令行临时覆盖
+    var configSource: DispatchSourceRead?
+    var configPending = Data()
+    var inlineEnv: [String: String]?
 
     private init() {
         cfg = AMConfig.load()
         bindings = AMBindings.load(takeoverEnabled: cfg.takeover)
+    }
+
+    func snapshotConfig() -> AMConfig {
+        lock.lock()
+        defer { lock.unlock() }
+        return cfg
     }
 
     var installed = false
@@ -428,13 +486,14 @@ private func amApplyBindings(_ fresh: AMBindings) {
 public func amRewriteOptions(_ json: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
     guard let json else { return nil }
     let s = AMState.shared
+    let cfg = s.snapshotConfig()
     let data = Data(bytes: json, count: strlen(json))
     guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         amLog("options: 前端传给 libryujinx 的 JSON 无法解析，原样放行")
         return nil
     }
     guard let loc = AMBindings.locatePlayer1(root),
-          let fresh = AMBindings.parse(root, source: "update_options", takeoverEnabled: s.cfg.takeover)
+          let fresh = AMBindings.parse(root, source: "update_options", takeoverEnabled: cfg.takeover)
     else {
         amLog("options: 前端传给 libryujinx 的 JSON 里找不到玩家输入配置，原样放行；顶层键: \(root.keys.sorted().prefix(15).joined(separator: ","))")
         return nil
@@ -451,7 +510,7 @@ public func amRewriteOptions(_ json: UnsafePointer<CChar>?) -> UnsafeMutablePoin
           let out = try? JSONSerialization.data(withJSONObject: patched, options: [.withoutEscapingSlashes]),
           let text = String(data: out, encoding: .utf8)
     else { return nil }
-    if firstTime || s.cfg.debug {
+    if firstTime || cfg.debug {
         let p1 = AMBindings.locatePlayer1(patched)?.config ?? [:]
         amLog("options: Player1 rewritten (\(data.count) -> \(out.count) bytes): \(p1.amKey("backend") ?? "backend")=\(p1[am: "backend"] ?? "?") \(p1.amKey("controllerId") ?? "controllerId")=\(p1[am: "controllerId"] ?? "?")")
     }
@@ -570,9 +629,10 @@ private func amCurrentModifiers(forKey key: Int32) -> NSEvent.ModifierFlags {
 @_cdecl("am_on_keyboard_key_pressed")
 public func amOnKeyboardKeyPressed(_ key: Int32, _ pressed: Int32) -> Bool {
     let s = AMState.shared
-    if key == Int32(s.cfg.toggleKeyCode) {
+    let cfg = s.snapshotConfig()
+    if key == Int32(cfg.toggleKeyCode) {
         if pressed != 0 {
-            if amCurrentModifiers(forKey: key) == s.cfg.toggleModifiers {
+            if amCurrentModifiers(forKey: key) == cfg.toggleModifiers {
                 s.lock.lock()
                 let wasDown = s.toggleKeyDown
                 s.toggleKeyDown = true
@@ -632,9 +692,9 @@ func amInstall() {
     let s = AMState.shared
     guard !s.installed else { return }
     s.installed = true
-    let cfg = s.cfg
 
     if let m = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp], handler: { event in
+        let cfg = AMState.shared.cfg
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         guard event.keyCode == cfg.toggleKeyCode && mods == cfg.toggleModifiers else { return event }
         if event.type == .keyDown && !event.isARepeat {
@@ -679,10 +739,83 @@ func amInstall() {
     RunLoop.main.add(timer, forMode: .common)
     s.ensureTimer = timer
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { amEnsureVirtualGamepad(reason: "startup") }
+    amInstallConfigWatcher()
 
-    amLog("installed: toggle=\(cfg.toggleDescription) fullSpeed=\(cfg.fullSpeed)pt/s curve=\(cfg.curve) smoothing=\(Int(cfg.smoothingTau * 1000))ms window=\(Int(cfg.window * 1000))ms antiDeadzone=\(cfg.antiDeadzone) invertY=\(cfg.invertY) controller=\(cfg.controllerOverride.map(String.init) ?? "auto") debug=\(cfg.debug)")
+    amLog("installed: \(s.cfg.summary)")
     amLog("bindings: \(s.bindings.summary)")
     amLog(s.bindings.player1Status)
+}
+
+// MARK: - config.env 热更新（文件由 astris-launch 监视，内容经管道送进来；见 launcher.c）
+
+private func amInstallConfigWatcher() {
+    let env = ProcessInfo.processInfo.environment
+    guard let fdText = env["ASTRIS_MOUSE_CONFIG_FD"], let fd = Int32(fdText) else { return }
+    let path = env["ASTRIS_MOUSE_CONFIG_FILE"] ?? "config.env"
+    _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+
+    let s = AMState.shared
+    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+    source.setEventHandler {
+        var chunk = [UInt8](repeating: 0, count: 16384)
+        while true {
+            let n = read(fd, &chunk, chunk.count)
+            if n > 0 { s.configPending.append(chunk, count: n); continue }
+            if n == 0 {
+                amLog("config: watcher pipe closed, live reload off")
+                s.configSource?.cancel()
+                s.configSource = nil
+                return
+            }
+            if errno == EINTR { continue }
+            break
+        }
+        // 帧：4 字节大端长度 + 内容
+        while s.configPending.count >= 4 {
+            let length = s.configPending.prefix(4).reduce(0) { ($0 << 8) | Int($1) }
+            guard s.configPending.count >= 4 + length else { break }
+            let body = s.configPending.subdata(in: 4..<(4 + length))
+            s.configPending.removeSubrange(0..<(4 + length))
+            amApplyConfigFile(String(decoding: body, as: UTF8.self), path: path)
+        }
+    }
+    source.resume()
+    s.configSource = source
+}
+
+private func amApplyConfigFile(_ text: String, path: String) {
+    let s = AMState.shared
+    let file = AMConfig.parseEnvFile(text)
+    let firstTime = s.inlineEnv == nil
+    if firstTime {
+        // 第一帧就是启动时的文件；启动环境里与之不符的键来自命令行前缀（如 ASTRIS_MOUSE_DEBUG=1 ./run.sh），
+        // 之后一直保留，文件里有同名键时以文件为准（和 run.sh 里 source 的先后顺序一致）
+        let launch = ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("ASTRIS_MOUSE_") }
+        s.inlineEnv = launch.filter { file[$0.key] != $0.value }
+    }
+    var merged = s.inlineEnv ?? [:]
+    for (k, v) in file { merged[k] = v }
+    var fresh = AMConfig.load(env: merged)
+    let requestedTakeover = fresh.takeover
+
+    s.lock.lock()
+    let old = s.cfg
+    fresh.takeover = old.takeover
+    s.cfg = fresh
+    s.lock.unlock()
+
+    if requestedTakeover != old.takeover {
+        amLog("config: ASTRIS_MOUSE_TAKEOVER 只在启动时生效，本次沿用 \(old.takeover)，重启后按新值")
+    }
+    let changes = fresh.changes(from: old)
+    let name = (path as NSString).lastPathComponent
+    if firstTime {
+        amLog("config: live reload on, watching \(path)" + (changes.isEmpty ? "" : "; " + changes.joined(separator: ", ")))
+    } else if changes.isEmpty {
+        amLog("config: \(name) reloaded, no effective changes")
+    } else {
+        amLog("config: \(name) applied: \(changes.joined(separator: ", "))")
+    }
 }
 
 private func amRegisterNotification(_ name: String, _ handler: @escaping () -> Void) {

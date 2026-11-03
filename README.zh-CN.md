@@ -52,7 +52,9 @@ cd astris-mouse-panning
 
 ## 配置
 
-把 `config.env.example` 复制为 `config.env`，取消注释想修改的行，然后用 `./run.sh` 重新启动。只想临时试一个值时，可以写在命令前面，例如 `ASTRIS_MOUSE_FULL_SPEED=300 ./run.sh`。
+把 `config.env.example` 复制为 `config.env`，取消注释想修改的行。Astris 运行中也可以改：保存文件后大约半秒内生效，不用重启（日志里会出现 `config: config.env applied: fullSpeed 400.0→300.0`）。唯一的例外是 `ASTRIS_MOUSE_TAKEOVER`，只在启动时读取。
+
+只想临时试一个值时，可以写在命令前面，例如 `ASTRIS_MOUSE_FULL_SPEED=300 ./run.sh`。`config.env` 里的值优先于命令行；从文件里删掉某一行，该项会恢复默认值。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -87,6 +89,7 @@ cd astris-mouse-panning
   ```
 - **能开关平移但镜头不动**：Player 1 没有绑定到虚拟手柄。看日志里有没有 `Configured Keyboard for Player1` 或 `Gamepad ID '...' requested for Player1 but not found`。确认 `ASTRIS_MOUSE_TAKEOVER` 没有设成 `0`，并且 Astris 输入设置里的 Player 1 不是 *Invalid*。
 - **上下视角反了**：设置 `ASTRIS_MOUSE_INVERT_Y=1`。
+- **改了 `config.env` 没反应**：本次启动的日志里应有 `config: live reload on, watching .../config.env`，每次保存后还会多一行 `[astris-launch] sent ...`。没有的话说明这个实例是用旧版本启动的，退出 Astris 重新 `./run.sh`。
 - **编译时找不到 `libryujinx.dylib`**：用 `ASTRIS_APP` 指向你的 `Astris.app`。
 - **其他问题**：用 `ASTRIS_MOUSE_DEBUG=1 ./run.sh` 启动并复现问题，然后把 `~/Library/Logs/AstrisMouse.log` 附在 issue 里。
 
@@ -97,7 +100,7 @@ cd astris-mouse-panning
 
 ## 工作原理
 
-1. `run.sh` 通过 `build/astris-launch` 启动 Astris，只在 Astris 进程里设置 `DYLD_INSERT_LIBRARIES`。Astris 的签名 entitlements（`com.apple.security.cs.allow-dyld-environment-variables` 和 `com.apple.security.cs.disable-library-validation`）允许这样做，无需重新签名。
+1. `run.sh` 通过 `build/astris-launch` 启动 Astris，只在 Astris 进程里设置 `DYLD_INSERT_LIBRARIES`。Astris 的签名 entitlements（`com.apple.security.cs.allow-dyld-environment-variables` 和 `com.apple.security.cs.disable-library-validation`）允许这样做，无需重新签名。`astris-launch` 还会留下一个很小的监视进程，用 kqueue 盯着 `config.env`，文件一变就把内容通过管道送进 dylib（Astris 是沙盒进程，自己读不了这个文件）。Astris 退出时监视进程跟着退出。
 2. `libAstrisMouse.dylib` 通过 dyld interpose 拦截 Astris 对 `libryujinx` 的调用：`update_options`、手柄连接与断开、摇杆、按键、键盘和 `stop_emulation`。
 3. Astris 会把整份设置 JSON 交给 `ryujinx_update_options`。如果其中 Player 1 是 Keyboard，dylib 先把这一项改写成 `backend: Gamepad, controllerId: AstrisMouse` 再转交，然后调用 `ryujinx_connect_controller("AstrisMouse", ...)`，让 Player 1 绑定到虚拟手柄。如果 Player 1 本来就是手柄，配置原样转交，虚拟手柄改用该手柄的 ID 注册，在没有真实手柄时顶上。
 4. Player 1 变成手柄后，`libryujinx` 不再把键盘映射给它，所以 dylib 从同一份配置里读取 Player 1 的键位，转发到虚拟手柄的摇杆和按键上。
@@ -111,7 +114,7 @@ cd astris-mouse-panning
 |---|---|
 | `Sources/AstrisMouse.swift` | 虚拟手柄生命周期、键盘转发、鼠标采样与滤波、热键、Darwin 通知 |
 | `Sources/interpose.c` | libryujinx 调用的 dyld interpose 表 |
-| `Sources/launcher.c` | `astris-launch`：在独立会话中启动 Astris，并只向它注入 dylib |
+| `Sources/launcher.c` | `astris-launch`：在独立会话中启动 Astris，只向它注入 dylib，并监视 `config.env` 实现热更新 |
 | `Sources/bridge.h`、`Sources/callbacks.h` | libryujinx C API 声明与 C 到 Swift 的回调 |
 | `build.sh`、`run.sh`、`uninstall.sh` | 编译、启动、清理 |
 | `config.env.example` | 配置模板 |

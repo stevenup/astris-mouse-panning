@@ -52,7 +52,9 @@ After pulling updates, run `./build.sh` to rebuild.
 
 ## Configuration
 
-Copy `config.env.example` to `config.env`, uncomment the lines you want to change, then relaunch with `./run.sh`. To try a value for a single launch, pass it inline, e.g. `ASTRIS_MOUSE_FULL_SPEED=300 ./run.sh`.
+Copy `config.env.example` to `config.env` and uncomment the lines you want to change. Edits are applied while Astris is running: save the file and the new values take effect within about half a second, no restart needed (the log shows `config: config.env applied: fullSpeed 400.0→300.0`). The one exception is `ASTRIS_MOUSE_TAKEOVER`, which is only read at launch.
+
+To try a value for a single launch, pass it inline, e.g. `ASTRIS_MOUSE_FULL_SPEED=300 ./run.sh`. Values in `config.env` win over inline ones, and removing a line from the file reverts that setting to its default.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -87,6 +89,7 @@ Key bindings are not configured here; they are read from Astris's own input sett
   ```
 - **Panning toggles but the camera does not move**: Player 1 is not bound to the virtual controller. Look for `Configured Keyboard for Player1` or `Gamepad ID '...' requested for Player1 but not found` in the log. Make sure `ASTRIS_MOUSE_TAKEOVER` is not `0`, and that Player 1 is not set to *Invalid* in Astris's input settings.
 - **Vertical look is inverted**: set `ASTRIS_MOUSE_INVERT_Y=1`.
+- **Edits to `config.env` are not picked up**: the log should contain `config: live reload on, watching .../config.env` from this launch and a `[astris-launch] sent ...` line after each save. If it does not, the instance was started with an older build; quit Astris and run `./run.sh` again.
 - **The build cannot find `libryujinx.dylib`**: point `ASTRIS_APP` at your `Astris.app`.
 - **Anything else**: launch with `ASTRIS_MOUSE_DEBUG=1 ./run.sh`, reproduce the problem, and attach `~/Library/Logs/AstrisMouse.log` to an issue.
 
@@ -97,7 +100,7 @@ Key bindings are not configured here; they are read from Astris's own input sett
 
 ## How it works
 
-1. `run.sh` starts Astris through `build/astris-launch`, which sets `DYLD_INSERT_LIBRARIES` only for the Astris process. Astris's code-signing entitlements (`com.apple.security.cs.allow-dyld-environment-variables` and `com.apple.security.cs.disable-library-validation`) allow this without re-signing.
+1. `run.sh` starts Astris through `build/astris-launch`, which sets `DYLD_INSERT_LIBRARIES` only for the Astris process. Astris's code-signing entitlements (`com.apple.security.cs.allow-dyld-environment-variables` and `com.apple.security.cs.disable-library-validation`) allow this without re-signing. `astris-launch` also leaves behind a tiny watcher process that follows `config.env` with kqueue and pushes its contents through a pipe into the dylib whenever the file changes; Astris is sandboxed and could not read the file itself. The watcher exits with Astris.
 2. `libAstrisMouse.dylib` uses dyld interposing to intercept Astris's calls into `libryujinx`: `update_options`, controller connect and disconnect, stick, button, keyboard, and `stop_emulation`.
 3. Astris passes its whole settings JSON to `ryujinx_update_options`. If Player 1 is set to Keyboard there, the dylib rewrites that one entry to `backend: Gamepad, controllerId: AstrisMouse` before forwarding it, then calls `ryujinx_connect_controller("AstrisMouse", ...)`, so Player 1 binds to the virtual controller. If Player 1 is already a gamepad, the config is forwarded unchanged and the virtual controller registers under that gamepad's ID so it fills in when no physical controller is present.
 4. Once Player 1 is a gamepad, `libryujinx` stops mapping the keyboard to it, so the dylib reads Player 1's key bindings from the same config and forwards them to the virtual controller's sticks and buttons.
@@ -111,7 +114,7 @@ Key bindings are not configured here; they are read from Astris's own input sett
 |---|---|
 | `Sources/AstrisMouse.swift` | Virtual controller lifecycle, keyboard forwarding, mouse sampling and filtering, hotkey, Darwin notifications |
 | `Sources/interpose.c` | dyld interpose table for the libryujinx calls |
-| `Sources/launcher.c` | `astris-launch`, which starts Astris in its own session and injects the dylib into it only |
+| `Sources/launcher.c` | `astris-launch`, which starts Astris in its own session, injects the dylib into it only, and watches `config.env` for live reloads |
 | `Sources/bridge.h`, `Sources/callbacks.h` | libryujinx C API declarations and C-to-Swift hooks |
 | `build.sh`, `run.sh`, `uninstall.sh` | Build, launch, and clean up |
 | `config.env.example` | Configuration template |

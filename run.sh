@@ -39,17 +39,19 @@ fi
 mkdir -p "$(dirname "$LOG")"
 echo "日志：$LOG"
 echo "切换平移：按 ${ASTRIS_MOUSE_TOGGLE:-cmd+alt+m}，或执行 notifyutil -p dev.astrismouse.toggle"
+echo "调参：改 $DIR/config.env 保存即生效，不用重启（ASTRIS_MOUSE_TAKEOVER 除外）"
 
-# DYLD_INSERT_LIBRARIES 只能出现在 Astris 自己的环境里：
+# DYLD_INSERT_LIBRARIES 只能出现在 Astris 自己的环境里：astris-launch 在 fork 之后才设置它，
 # 不能 export，也不能经过 nohup/env/tee 等系统二进制（它们会尝试加载并失败）。
+# -c 让 astris-launch 顺带监视 config.env，改动实时送进 Astris。
 if [ "${ASTRIS_MOUSE_FOREGROUND:-0}" = "1" ]; then
   if [ $# -gt 0 ]; then
     (sleep 4 && open -a "$APP" "$@") &
   fi
-  DYLD_INSERT_LIBRARIES="$DYLIB" exec "$BIN" 2>&1 | tee -a "$LOG"
+  exec "$DIR/build/astris-launch" -f -c "$DIR/config.env" "$DYLIB" "$LOG" "$BIN" 2>&1 | tee -a "$LOG"
 fi
 
-PID="$("$DIR/build/astris-launch" "$DYLIB" "$LOG" "$BIN")"
+PID="$("$DIR/build/astris-launch" -c "$DIR/config.env" "$DYLIB" "$LOG" "$BIN")"
 sleep 1
 if kill -0 "${PID}" 2>/dev/null; then
   echo "Astris 已在后台启动（pid ${PID}）。查看日志：tail -f \"${LOG}\""
