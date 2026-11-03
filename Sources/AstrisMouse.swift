@@ -22,8 +22,9 @@ func amLog(_ message: @autoclosure () -> String) {
 struct AMConfig {
     var fullSpeed = 400.0          // 鼠标速度（pt/s）达到该值时摇杆满偏
     var curve = 1.0                // 响应曲线指数，>1 低速更细腻
-    var smoothingTau = 0.020       // 一阶低通时间常数（秒）
-    var window = 0.024             // 速度估计窗口（秒）
+    var smoothingTau = 0.005       // 一阶低通时间常数（秒），只作用于运动中的速度变化；起步、停止不经过它
+    var averageEvents = 2          // 瞬时速度取最近几次鼠标事件的位移 / 实际时间跨度
+    var holdTime = 0.0             // 多久没有鼠标事件就把摇杆归零（秒）；0 = 按鼠标回报间隔自适应
     var antiDeadzone = 0.10        // 补偿 Astris 侧 deadzoneRight
     var outputDeadzone = 0.02      // 低于此幅值输出 0
     var invertY = false
@@ -67,7 +68,11 @@ struct AMConfig {
         if let v = num("ASTRIS_MOUSE_FULL_SPEED"), v > 0 { c.fullSpeed = v }
         if let v = num("ASTRIS_MOUSE_CURVE"), v > 0 { c.curve = v }
         if let v = num("ASTRIS_MOUSE_SMOOTHING_MS"), v >= 0 { c.smoothingTau = v / 1000 }
-        if let v = num("ASTRIS_MOUSE_WINDOW_MS"), v > 0 { c.window = v / 1000 }
+        if let v = num("ASTRIS_MOUSE_AVERAGE"), v >= 1, v <= 8 { c.averageEvents = Int(v) }
+        if let v = num("ASTRIS_MOUSE_HOLD_MS"), v >= 0 { c.holdTime = v / 1000 }
+        if env["ASTRIS_MOUSE_WINDOW_MS"] != nil {
+            amLog("ASTRIS_MOUSE_WINDOW_MS 已不再使用（速度改按鼠标事件时间戳计算），忽略；停止判定见 ASTRIS_MOUSE_HOLD_MS")
+        }
         if let v = num("ASTRIS_MOUSE_ANTI_DEADZONE"), v >= 0, v < 1 { c.antiDeadzone = v }
         if let v = num("ASTRIS_MOUSE_OUTPUT_DEADZONE"), v >= 0, v < 1 { c.outputDeadzone = v }
         if let v = flag("ASTRIS_MOUSE_INVERT_Y") { c.invertY = v }
@@ -138,8 +143,10 @@ struct AMConfig {
         return out
     }
 
+    var holdDescription: String { holdTime > 0 ? "\(Int(holdTime * 1000))ms" : "auto" }
+
     var summary: String {
-        "toggle=\(toggleDescription) fullSpeed=\(fullSpeed)pt/s curve=\(curve) smoothing=\(Int(smoothingTau * 1000))ms window=\(Int(window * 1000))ms antiDeadzone=\(antiDeadzone) outputDeadzone=\(outputDeadzone) invertY=\(invertY) mouseButtons=\(mouseButtonsDescription) controller=\(controllerOverride.map(String.init) ?? "auto") takeover=\(takeover) sound=\(sound) debug=\(debug)"
+        "toggle=\(toggleDescription) fullSpeed=\(fullSpeed)pt/s curve=\(curve) smoothing=\(Int(smoothingTau * 1000))ms average=\(averageEvents) hold=\(holdDescription) antiDeadzone=\(antiDeadzone) outputDeadzone=\(outputDeadzone) invertY=\(invertY) mouseButtons=\(mouseButtonsDescription) controller=\(controllerOverride.map(String.init) ?? "auto") takeover=\(takeover) sound=\(sound) debug=\(debug)"
     }
 
     func changes(from old: AMConfig) -> [String] {
@@ -150,7 +157,8 @@ struct AMConfig {
         cmp("fullSpeed", old.fullSpeed, fullSpeed)
         cmp("curve", old.curve, curve)
         cmp("smoothingMs", Int(old.smoothingTau * 1000), Int(smoothingTau * 1000))
-        cmp("windowMs", Int(old.window * 1000), Int(window * 1000))
+        cmp("average", old.averageEvents, averageEvents)
+        cmp("hold", old.holdDescription, holdDescription)
         cmp("antiDeadzone", old.antiDeadzone, antiDeadzone)
         cmp("outputDeadzone", old.outputDeadzone, outputDeadzone)
         cmp("invertY", old.invertY, invertY)
@@ -468,10 +476,15 @@ final class AMState {
     var mouseHeld = Set<Int>()      // 平移中被我们吞掉 mouseDown 的鼠标键号
 
     var frontendRight: (x: Float, y: Float) = (0, 0)
-    var samples: [(t: Double, dx: Double, dy: Double)] = []
+    var events: [(t: Double, dx: Double, dy: Double)] = []   // 最近 100ms 内的鼠标位移，t 为事件时间戳
+    var velocity: (x: Double, y: Double) = (0, 0)             // 最近一次事件估出的瞬时速度 pt/s
+    var holdUntil: Double = 0                                 // 过了这个时刻还没新事件就视为鼠标已停
+    var holdTimer: DispatchSourceTimer?
     var filtered: (x: Double, y: Double) = (0, 0)
+    var lastUpdate: Double = 0
     var lastSent: (x: Float, y: Float) = (0, 0)
     var startTime: Double = 0
+    var eventOffsetLogged = false
     var moves = 0
     var sends = 0
     var swallowed = 0
@@ -878,7 +891,7 @@ public func amOnKeyboardKeyPressed(_ key: Int32, _ pressed: Int32) -> Bool {
     static let shared = AMTicker()
 
     @objc func tick(_ link: CADisplayLink) {
-        amTick(dt: max(link.duration, 1.0 / 240.0))
+        amTick()
     }
 }
 
@@ -903,7 +916,7 @@ func amInstall() {
         matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged],
         handler: { event in
             guard AMState.shared.active else { return event }
-            amAccumulate(dx: event.deltaX, dy: event.deltaY)
+            amAccumulate(event)
             return nil
         }
     ) {
@@ -1073,20 +1086,25 @@ func amStart(reason: String) {
     s.hideCount = 1
 
     s.lock.lock()
-    s.samples.removeAll()
+    s.events.removeAll()
+    s.velocity = (0, 0)
+    s.holdUntil = 0
     s.filtered = (0, 0)
+    s.lastUpdate = 0
     s.lastSent = (0, 0)
     s.frontendRight = (0, 0)
     s.moves = 0
     s.sends = 0
     s.swallowed = 0
     s.startTime = CACurrentMediaTime()
+    s.eventOffsetLogged = false
     s.active = true
     s.lock.unlock()
 
     let link = window.displayLink(target: AMTicker.shared, selector: #selector(AMTicker.tick(_:)))
     link.add(to: .main, forMode: .common)
     s.displayLink = link
+    s.holdTimer = amMakeHoldTimer()
 
     if s.cfg.sound { NSSound(named: "Tink")?.play() }
     amLog("panning ON (\(reason)) controller=\(s.handle.map(String.init) ?? "none") \(s.usingPhysical ? "physical" : "virtual") window=\"\(window.title)\" pinned at \(center)")
@@ -1105,6 +1123,8 @@ func amStop(reason: String) {
 
     s.displayLink?.invalidate()
     s.displayLink = nil
+    s.holdTimer?.cancel()
+    s.holdTimer = nil
 
     CGAssociateMouseAndMouseCursorPosition(1)
     while s.hideCount > 0 {
@@ -1128,38 +1148,109 @@ func amStop(reason: String) {
 
 // MARK: - 采样与输出
 
-private func amAccumulate(dx: CGFloat, dy: CGFloat) {
-    let s = AMState.shared
-    let now = CACurrentMediaTime()
-    s.lock.lock()
-    // 刚 warp 过的前 60ms 内 delta 不可信，丢弃
-    if now - s.startTime > 0.06 {
-        s.samples.append((now, Double(dx), Double(dy)))
-        s.moves += 1
-    }
-    s.lock.unlock()
-}
+private let amFirstEventSpread = 0.016     // 静止后第一个事件没有前一个事件可算速度：把这段位移摊在接下来 16ms 上输出
+private let amRestGap = 0.050              // 两次事件相隔超过这个值就当作重新起步
+private let amMergeGap = 0.0005            // 时间戳几乎相同的事件并成一个
 
-private func amTick(dt: Double) {
+// 每个鼠标事件：用事件时间戳算瞬时速度，立刻输出；再定一个"没有下一个事件就归零"的时限。
+// 速度 = 最近 averageEvents 次位移之和 / 这段实际跨度，所以起步第二个事件起就是真实速度，不像固定窗口要慢慢填满。
+private func amAccumulate(_ event: NSEvent) {
     let s = AMState.shared
     let cfg = s.cfg
     let now = CACurrentMediaTime()
+    var t = event.timestamp
+    if abs(t - now) > 1 { t = now }     // 时间基对不上就退回到达时间
+    let dx = Double(event.deltaX), dy = Double(event.deltaY)
+
+    s.lock.lock()
+    // 刚 warp 过的前 60ms 内 delta 不可信，丢弃
+    guard s.active, now - s.startTime > 0.06 else { s.lock.unlock(); return }
+    s.moves += 1
+    if cfg.debug && !s.eventOffsetLogged {
+        s.eventOffsetLogged = true
+        amLog(String(format: "mouse event delivery latency %.1fms (timestamp→arrival)", (now - t) * 1000))
+    }
+
+    if let last = s.events.last, t - last.t < amMergeGap {
+        s.events[s.events.count - 1].dx += dx
+        s.events[s.events.count - 1].dy += dy
+    } else {
+        s.events.append((t, dx, dy))
+    }
+    s.events.removeAll { $0.t < t - 0.1 }
+    let events = s.events
+    let n = events.count
+    let last = events[n - 1]
+
+    let hold: Double
+    if n == 1 || last.t - events[n - 2].t > amRestGap {
+        // 起步：先按"位移摊在 16ms 上"输出，第二个事件一到就是真实速度；这样轻推一下不会过冲
+        s.velocity = (last.dx / amFirstEventSpread, last.dy / amFirstEventSpread)
+        hold = cfg.holdTime > 0 ? cfg.holdTime : amFirstEventSpread
+    } else {
+        let interval = last.t - events[n - 2].t
+        var sumX = last.dx, sumY = last.dy
+        var anchor = n - 2
+        var used = 1
+        while used < cfg.averageEvents, anchor > 0, events[anchor].t - events[anchor - 1].t <= amRestGap {
+            sumX += events[anchor].dx
+            sumY += events[anchor].dy
+            anchor -= 1
+            used += 1
+        }
+        let span = last.t - events[anchor].t
+        s.velocity = (sumX / span, sumY / span)
+        // 下一个事件应在约一个间隔后到；多等半个间隔加 4ms 抖动余量还没来，就是停了
+        hold = cfg.holdTime > 0 ? cfg.holdTime : min(max(interval * 1.5 + 0.004, 0.012), 0.060)
+    }
+    s.holdUntil = t + hold
+    s.lock.unlock()
+
+    // 时限一到就归零，不等下一帧
+    s.holdTimer?.schedule(deadline: .now() + max(hold - (now - t), 0) + 0.0005, leeway: .microseconds(100))
+
+    amUpdate(now: now)
+}
+
+// Timer / 普通 GCD 定时器会被系统合并推迟 5–9ms，停止会明显拖后，所以用 strict
+func amMakeHoldTimer() -> DispatchSourceTimer {
+    let timer = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+    timer.schedule(deadline: .distantFuture)
+    timer.setEventHandler { amUpdate(now: CACurrentMediaTime()) }
+    timer.resume()
+    return timer
+}
+
+private func amTick() {
+    let s = AMState.shared
+    let now = CACurrentMediaTime()
+    guard s.active else { return }
+    amUpdate(now: now)
+
+    // Astris 自己的 hide/unhide 可能把光标放出来；周期性补一次 hide，计数在 stop 时成对归还
+    if now - s.lastCursorCheck > 2.0 {
+        s.lastCursorCheck = now
+        if NSApp.isActive && s.hideCount < 3 {
+            NSCursor.hide()
+            s.hideCount += 1
+        }
+    }
+}
+
+// 当前速度 → 摇杆值并发送。起步直接跳到目标值、停止直接归零，低通只平滑运动中的速度变化。
+private func amUpdate(now: Double) {
+    let s = AMState.shared
+    let cfg = s.cfg
 
     s.lock.lock()
     guard s.active else { s.lock.unlock(); return }
-    let cutoff = now - cfg.window
-    s.samples.removeAll { $0.t < cutoff }
-    var sumX = 0.0, sumY = 0.0
-    for sample in s.samples {
-        sumX += sample.dx
-        sumY += sample.dy
-    }
+    let velocity = now < s.holdUntil ? s.velocity : (0.0, 0.0)
     let frontend = s.frontendRight
     s.lock.unlock()
 
-    // 窗口平均速度 → 目标摇杆向量（y 轴向上为正；Cocoa deltaY 向下为正）
-    var targetX = (sumX / cfg.window) / cfg.fullSpeed
-    var targetY = -(sumY / cfg.window) / cfg.fullSpeed
+    // 速度 → 目标摇杆向量（y 轴向上为正；Cocoa deltaY 向下为正）
+    var targetX = velocity.0 / cfg.fullSpeed
+    var targetY = -velocity.1 / cfg.fullSpeed
     if cfg.invertY { targetY = -targetY }
     let targetMag = (targetX * targetX + targetY * targetY).squareRoot()
     if targetMag > 0 {
@@ -1168,10 +1259,16 @@ private func amTick(dt: Double) {
         targetY *= shaped / targetMag
     }
 
-    let alpha = cfg.smoothingTau > 0 ? 1 - exp(-dt / cfg.smoothingTau) : 1
-    s.filtered.x += (targetX - s.filtered.x) * alpha
-    s.filtered.y += (targetY - s.filtered.y) * alpha
-
+    let dt = s.lastUpdate > 0 ? now - s.lastUpdate : 0
+    s.lastUpdate = now
+    let wasStill = s.filtered.x == 0 && s.filtered.y == 0
+    if targetMag == 0 || wasStill || cfg.smoothingTau <= 0 {
+        s.filtered = (targetX, targetY)
+    } else {
+        let alpha = 1 - exp(-dt / cfg.smoothingTau)
+        s.filtered.x += (targetX - s.filtered.x) * alpha
+        s.filtered.y += (targetY - s.filtered.y) * alpha
+    }
     var outX = s.filtered.x
     var outY = s.filtered.y
     let outMag = (outX * outX + outY * outY).squareRoot()
@@ -1189,15 +1286,6 @@ private func amTick(dt: Double) {
         out = frontend
     }
     amSend(out)
-
-    // Astris 自己的 hide/unhide 可能把光标放出来；周期性补一次 hide，计数在 stop 时成对归还
-    if now - s.lastCursorCheck > 2.0 {
-        s.lastCursorCheck = now
-        if NSApp.isActive && s.hideCount < 3 {
-            NSCursor.hide()
-            s.hideCount += 1
-        }
-    }
 }
 
 private func amSend(_ v: (x: Float, y: Float)) {
@@ -1208,7 +1296,7 @@ private func amSend(_ v: (x: Float, y: Float)) {
     s.lastSent = v
     s.sends += 1
     if s.cfg.debug && s.sends % 30 == 0 {
-        amLog("send stick_axis(controller=\(handle), stick=1, x=\(v.x), y=\(v.y)) samples=\(s.samples.count)")
+        amLog("send stick_axis(controller=\(handle), stick=1, x=\(v.x), y=\(v.y)) velocity=(\(Int(s.velocity.x)), \(Int(s.velocity.y)))pt/s events=\(s.events.count)")
     }
 }
 

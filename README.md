@@ -11,7 +11,7 @@ Mouse-to-key tools such as [MacRMB](https://github.com/ikoshura/MacRMB) turn the
 
 ## Features
 
-- **Analog right stick**: mouse movement is filtered and mapped to continuous stick deflection, updated every display frame.
+- **Analog right stick**: mouse movement is mapped to continuous stick deflection from the mouse event timestamps, sent on every mouse report, and snapped back to zero as soon as the mouse stops.
 - **Mouse buttons as controller buttons**: bind left, right, middle, and the two side buttons to any controller button (for example left → ZL, right → ZR). Active only while panning, so clicks work normally in menus.
 - **Works with Player 1 set to Keyboard**: the common Astris setup (Player 1 → Keyboard) is taken over transparently. The configuration handed to `libryujinx` is rewritten in memory so Player 1 becomes the virtual controller; Astris's own settings and preference file are left untouched.
 - **Keyboard keeps working**: Player 1's key bindings from Astris's input settings are forwarded to the virtual controller, and edits there take effect immediately.
@@ -61,8 +61,9 @@ To try a value for a single launch, pass it inline, e.g. `ASTRIS_MOUSE_FULL_SPEE
 |---|---|---|
 | `ASTRIS_MOUSE_FULL_SPEED` | `400` | Mouse speed in pt/s that maps to full stick tilt. Lower is more sensitive. |
 | `ASTRIS_MOUSE_CURVE` | `1` | Response curve exponent. 1.5–2 gives finer control at low speeds. |
-| `ASTRIS_MOUSE_SMOOTHING_MS` | `20` | Low-pass filter time constant. Higher is smoother but floatier. |
-| `ASTRIS_MOUSE_WINDOW_MS` | `24` | Velocity estimation window. Use 24–32 for 125 Hz mice and 8–12 for 1000 Hz mice. |
+| `ASTRIS_MOUSE_SMOOTHING_MS` | `5` | Low-pass time constant applied only to speed changes while the mouse is moving; starting and stopping bypass it. `0` disables; try 10–15 if the speed feels uneven. |
+| `ASTRIS_MOUSE_AVERAGE` | `2` | Velocity is the displacement of the last N mouse events over their actual time span. `1` is the most responsive but jittery; 3–4 is steadier but reacts to speed changes one event later. |
+| `ASTRIS_MOUSE_HOLD_MS` | `0` (auto) | How long without a mouse event before the stick snaps back to zero. Auto uses 1.5× the mouse report interval + 4 ms (about 16 ms for a 125 Hz mouse). Raise to ~30 if slow movements stutter. |
 | `ASTRIS_MOUSE_ANTI_DEADZONE` | `0.10` | Non-zero output starts at this magnitude. Match it to Astris's right-stick deadzone (0.1 by default) so small movements still register. |
 | `ASTRIS_MOUSE_OUTPUT_DEADZONE` | `0.02` | Output below this magnitude is sent as zero to prevent drift. |
 | `ASTRIS_MOUSE_INVERT_Y` | `0` | Invert the vertical axis. |
@@ -107,7 +108,7 @@ Key bindings are not configured here; they are read from Astris's own input sett
 2. `libAstrisMouse.dylib` uses dyld interposing to intercept Astris's calls into `libryujinx`: `update_options`, controller connect and disconnect, stick, button, keyboard, and `stop_emulation`.
 3. Astris passes its whole settings JSON to `ryujinx_update_options`. If Player 1 is set to Keyboard there, the dylib rewrites that one entry to `backend: Gamepad, controllerId: AstrisMouse` before forwarding it, then calls `ryujinx_connect_controller("AstrisMouse", ...)`, so Player 1 binds to the virtual controller. If Player 1 is already a gamepad, the config is forwarded unchanged and the virtual controller registers under that gamepad's ID so it fills in when no physical controller is present.
 4. Once Player 1 is a gamepad, `libryujinx` stops mapping the keyboard to it, so the dylib reads Player 1's key bindings from the same config and forwards them to the virtual controller's sticks and buttons.
-5. While panning is on, the cursor is hidden and decoupled from the mouse. On every display frame, recent mouse deltas are converted to a velocity, shaped by the response curve, low-pass filtered, offset past the deadzone, and written to the right stick with `ryujinx_set_controller_stick_axis`.
+5. While panning is on, the cursor is hidden and decoupled from the mouse. Each mouse event is converted to an instantaneous velocity using the event timestamps (displacement of the last few events over their real time span), shaped by the response curve, lightly low-pass filtered, offset past the deadzone, and written to the right stick with `ryujinx_set_controller_stick_axis` right away. A strict timer zeroes the stick as soon as the next report fails to arrive on schedule, so stopping the mouse stops the camera within roughly one report interval instead of draining a window.
 
 ## Development
 

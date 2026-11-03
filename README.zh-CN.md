@@ -11,7 +11,7 @@
 
 ## 特性
 
-- **模拟量右摇杆**：鼠标移动经过滤波后映射为连续的摇杆偏移，每个显示帧更新一次。
+- **模拟量右摇杆**：按鼠标事件时间戳把移动映射为连续的摇杆偏移，每次鼠标回报都立即发送，鼠标一停摇杆立刻归零。
 - **鼠标键当手柄键**：左键、右键、中键和两个侧键都可以绑定到任意手柄按键（比如左键 → ZL，右键 → ZR）。只在平移开启时生效，关闭后点菜单不受影响。
 - **Player 1 设为键盘也能用**：Astris 最常见的设置（Player 1 → Keyboard）会被透明接管：交给 `libryujinx` 的配置在内存里改写，让 Player 1 绑定到虚拟手柄；Astris 自己的设置和偏好文件原封不动。
 - **键盘照常可用**：自动读取 Astris 输入设置里 Player 1 的键位并转发给虚拟手柄，在 Astris 里改键位会立即生效。
@@ -61,8 +61,9 @@ cd astris-mouse-panning
 |---|---|---|
 | `ASTRIS_MOUSE_FULL_SPEED` | `400` | 鼠标速度达到多少 pt/s 时摇杆满偏。越小越灵敏。 |
 | `ASTRIS_MOUSE_CURVE` | `1` | 响应曲线指数。设为 1.5–2 时低速更细腻。 |
-| `ASTRIS_MOUSE_SMOOTHING_MS` | `20` | 低通滤波时间常数。越大越顺滑，但也越“飘”。 |
-| `ASTRIS_MOUSE_WINDOW_MS` | `24` | 速度估计窗口。125 Hz 鼠标建议 24–32，1000 Hz 鼠标可降到 8–12。 |
+| `ASTRIS_MOUSE_SMOOTHING_MS` | `5` | 低通时间常数，只作用于运动中的速度变化；起步和停止不经过它。`0` 关闭；觉得速度忽快忽慢可以试 10–15。 |
+| `ASTRIS_MOUSE_AVERAGE` | `2` | 瞬时速度 = 最近 N 次鼠标事件的位移 / 实际时间跨度。`1` 最跟手但抖，3–4 更稳但变速慢一个事件。 |
+| `ASTRIS_MOUSE_HOLD_MS` | `0`（自适应） | 多久没有鼠标事件就把摇杆归零。自适应 = 鼠标回报间隔 ×1.5 + 4 ms（125 Hz 鼠标约 16 ms）。慢速移动时一顿一顿可以调到 30 左右。 |
 | `ASTRIS_MOUSE_ANTI_DEADZONE` | `0.10` | 非零输出的起始幅值。与 Astris 的右摇杆死区（默认 0.1）保持一致，微小移动才能被识别。 |
 | `ASTRIS_MOUSE_OUTPUT_DEADZONE` | `0.02` | 幅值低于此值时输出 0，防止漂移。 |
 | `ASTRIS_MOUSE_INVERT_Y` | `0` | 反转垂直方向。 |
@@ -107,7 +108,7 @@ cd astris-mouse-panning
 2. `libAstrisMouse.dylib` 通过 dyld interpose 拦截 Astris 对 `libryujinx` 的调用：`update_options`、手柄连接与断开、摇杆、按键、键盘和 `stop_emulation`。
 3. Astris 会把整份设置 JSON 交给 `ryujinx_update_options`。如果其中 Player 1 是 Keyboard，dylib 先把这一项改写成 `backend: Gamepad, controllerId: AstrisMouse` 再转交，然后调用 `ryujinx_connect_controller("AstrisMouse", ...)`，让 Player 1 绑定到虚拟手柄。如果 Player 1 本来就是手柄，配置原样转交，虚拟手柄改用该手柄的 ID 注册，在没有真实手柄时顶上。
 4. Player 1 变成手柄后，`libryujinx` 不再把键盘映射给它，所以 dylib 从同一份配置里读取 Player 1 的键位，转发到虚拟手柄的摇杆和按键上。
-5. 平移开启时，光标被隐藏并与鼠标解耦。每个显示帧都会把最近的鼠标位移换算成速度，经过响应曲线、低通滤波和死区补偿后，用 `ryujinx_set_controller_stick_axis` 写入右摇杆。
+5. 平移开启时，光标被隐藏并与鼠标解耦。每个鼠标事件都按事件时间戳换算成瞬时速度（最近几次位移 / 实际时间跨度），经过响应曲线、轻微低通和死区补偿后，立刻用 `ryujinx_set_controller_stick_axis` 写入右摇杆。另有一个精确定时器：下一次鼠标回报没按时到，就把摇杆归零，所以鼠标一停镜头大约一个回报周期内就停，不用等窗口排空。
 
 ## 开发
 
