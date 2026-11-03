@@ -12,6 +12,7 @@
 ## 特性
 
 - **模拟量右摇杆**：鼠标移动经过滤波后映射为连续的摇杆偏移，每个显示帧更新一次。
+- **鼠标键当手柄键**：左键、右键、中键和两个侧键都可以绑定到任意手柄按键（比如左键 → ZL，右键 → ZR）。只在平移开启时生效，关闭后点菜单不受影响。
 - **Player 1 设为键盘也能用**：Astris 最常见的设置（Player 1 → Keyboard）会被透明接管：交给 `libryujinx` 的配置在内存里改写，让 Player 1 绑定到虚拟手柄；Astris 自己的设置和偏好文件原封不动。
 - **键盘照常可用**：自动读取 Astris 输入设置里 Player 1 的键位并转发给虚拟手柄，在 Astris 里改键位会立即生效。
 - **真手柄优先**：Player 1 在 Astris 里设为手柄、且该真实手柄已连接时，虚拟手柄自动让位，鼠标改为驱动真实手柄的右摇杆；真实手柄断开后，虚拟手柄自动恢复。
@@ -65,6 +66,7 @@ cd astris-mouse-panning
 | `ASTRIS_MOUSE_ANTI_DEADZONE` | `0.10` | 非零输出的起始幅值。与 Astris 的右摇杆死区（默认 0.1）保持一致，微小移动才能被识别。 |
 | `ASTRIS_MOUSE_OUTPUT_DEADZONE` | `0.02` | 幅值低于此值时输出 0，防止漂移。 |
 | `ASTRIS_MOUSE_INVERT_Y` | `0` | 反转垂直方向。 |
+| `ASTRIS_MOUSE_BUTTON_LEFT` / `_RIGHT` / `_MIDDLE` / `_4` / `_5` | 不绑定 | 平移开启时按住该鼠标键所对应的手柄按键。可用名字：`a b x y minus plus home l r zl zr lstick rstick up down left right`（也认 `lt`/`rt`、`l2`/`r2`、`l3`/`r3`、`select`/`start` 等别名），`none` 表示不绑定。`_4`/`_5` 是两个侧键（后退/前进）。A/B/X/Y 按 Switch 上的标签来，自动跟随 Astris 的 *Nintendo layout* 设置。 |
 | `ASTRIS_MOUSE_TOGGLE` | `cmd+alt+m` | 开关热键。修饰键：`cmd`、`alt`、`ctrl`、`shift`；按键：`a`–`z`、`0`–`9`、`f1`–`f15`、`space`、`tab`、`esc`、`return`，或直接写键码数字。 |
 | `ASTRIS_MOUSE_SOUND` | `1` | 开关平移时播放提示音。 |
 | `ASTRIS_MOUSE_CONTROLLER` | 自动 | 强制指定 libryujinx 的手柄句柄，一般不需要。 |
@@ -89,6 +91,7 @@ cd astris-mouse-panning
   ```
 - **能开关平移但镜头不动**：Player 1 没有绑定到虚拟手柄。看日志里有没有 `Configured Keyboard for Player1` 或 `Gamepad ID '...' requested for Player1 but not found`。确认 `ASTRIS_MOUSE_TAKEOVER` 没有设成 `0`，并且 Astris 输入设置里的 Player 1 不是 *Invalid*。
 - **上下视角反了**：设置 `ASTRIS_MOUSE_INVERT_Y=1`。
+- **绑定的鼠标键没反应或按住会断**：先确认平移已开启（鼠标键绑定只在平移时生效），再看日志有没有 `ASTRIS_MOUSE_BUTTON_... 无法识别`。如果用了 Karabiner、BetterTouchTool 之类的改键工具，它们可能把长按右键改成了别的按键，Astris 就收不到原始的鼠标事件；给 Astris（Bundle ID `V380-Ori.Astris`）加一条例外规则即可。
 - **改了 `config.env` 没反应**：本次启动的日志里应有 `config: live reload on, watching .../config.env`，每次保存后还会多一行 `[astris-launch] sent ...`。没有的话说明这个实例是用旧版本启动的，退出 Astris 重新 `./run.sh`。
 - **编译时找不到 `libryujinx.dylib`**：用 `ASTRIS_APP` 指向你的 `Astris.app`。
 - **其他问题**：用 `ASTRIS_MOUSE_DEBUG=1 ./run.sh` 启动并复现问题，然后把 `~/Library/Logs/AstrisMouse.log` 附在 issue 里。

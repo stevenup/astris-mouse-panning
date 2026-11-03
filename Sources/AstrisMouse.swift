@@ -34,6 +34,16 @@ struct AMConfig {
     var takeover = true            // Player1 不是手柄后端时，改写传给 libryujinx 的配置让它绑定虚拟手柄
     var debug = false
     var sound = true
+    // 鼠标键（NSEvent.buttonNumber：0 左 1 右 2 中 3/4 侧键）→ Switch 按键；只在平移开启时生效
+    var mouseButtons: [Int: AMButton] = [:]
+
+    static let mouseButtonNumbers: [(env: String, number: Int, label: String)] = [
+        ("LEFT", 0, "left"), ("RIGHT", 1, "right"), ("MIDDLE", 2, "middle"), ("4", 3, "button4"), ("5", 4, "button5"),
+    ]
+
+    static func mouseButtonLabel(_ number: Int) -> String {
+        mouseButtonNumbers.first { $0.number == number }?.label ?? "button\(number + 1)"
+    }
 
     static let keyCodes: [String: UInt16] = [
         "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11,
@@ -86,7 +96,22 @@ struct AMConfig {
                 amLog("ASTRIS_MOUSE_TOGGLE=\(spec) 无法解析，沿用默认 cmd+alt+m")
             }
         }
+        for entry in mouseButtonNumbers {
+            guard let raw = env["ASTRIS_MOUSE_BUTTON_\(entry.env)"] else { continue }
+            let spec = raw.trimmingCharacters(in: .whitespaces)
+            if spec.isEmpty || ["none", "off"].contains(spec.lowercased()) { continue }
+            if let button = AMButton.parse(spec) {
+                c.mouseButtons[entry.number] = button
+            } else {
+                amLog("ASTRIS_MOUSE_BUTTON_\(entry.env)=\(raw) 无法识别，可用: \(AMButton.allNames)")
+            }
+        }
         return c
+    }
+
+    var mouseButtonsDescription: String {
+        guard !mouseButtons.isEmpty else { return "none" }
+        return mouseButtons.keys.sorted().map { "\(AMConfig.mouseButtonLabel($0)):\(mouseButtons[$0]!.name)" }.joined(separator: ",")
     }
 
     // 解析 config.env 文本：支持 `export KEY=VALUE`、引号、行尾注释；只认 ASTRIS_MOUSE_* 键
@@ -114,7 +139,7 @@ struct AMConfig {
     }
 
     var summary: String {
-        "toggle=\(toggleDescription) fullSpeed=\(fullSpeed)pt/s curve=\(curve) smoothing=\(Int(smoothingTau * 1000))ms window=\(Int(window * 1000))ms antiDeadzone=\(antiDeadzone) outputDeadzone=\(outputDeadzone) invertY=\(invertY) controller=\(controllerOverride.map(String.init) ?? "auto") takeover=\(takeover) sound=\(sound) debug=\(debug)"
+        "toggle=\(toggleDescription) fullSpeed=\(fullSpeed)pt/s curve=\(curve) smoothing=\(Int(smoothingTau * 1000))ms window=\(Int(window * 1000))ms antiDeadzone=\(antiDeadzone) outputDeadzone=\(outputDeadzone) invertY=\(invertY) mouseButtons=\(mouseButtonsDescription) controller=\(controllerOverride.map(String.init) ?? "auto") takeover=\(takeover) sound=\(sound) debug=\(debug)"
     }
 
     func changes(from old: AMConfig) -> [String] {
@@ -130,6 +155,7 @@ struct AMConfig {
         cmp("outputDeadzone", old.outputDeadzone, outputDeadzone)
         cmp("invertY", old.invertY, invertY)
         cmp("toggle", old.toggleDescription, toggleDescription)
+        cmp("mouseButtons", old.mouseButtonsDescription, mouseButtonsDescription)
         cmp("controller", old.controllerOverride.map(String.init) ?? "auto", controllerOverride.map(String.init) ?? "auto")
         cmp("sound", old.sound, sound)
         cmp("debug", old.debug, debug)
@@ -140,10 +166,58 @@ struct AMConfig {
 // MARK: - Astris 键位配置 → 虚拟手柄映射
 
 // libryujinx C API 的按钮编号（内部再查表转成 GamepadButtonInputId）
-enum AMButton: Int32 {
+enum AMButton: Int32, CaseIterable {
     case a = 0, b = 1, x = 2, y = 3, minus = 4, home = 5, plus = 6
     case leftStick = 7, rightStick = 8, l = 9, r = 10
     case dpadUp = 11, dpadDown = 12, dpadLeft = 13, dpadRight = 14, zl = 15, zr = 16
+
+    var name: String {
+        switch self {
+        case .a: return "a"
+        case .b: return "b"
+        case .x: return "x"
+        case .y: return "y"
+        case .minus: return "minus"
+        case .home: return "home"
+        case .plus: return "plus"
+        case .leftStick: return "lstick"
+        case .rightStick: return "rstick"
+        case .l: return "l"
+        case .r: return "r"
+        case .dpadUp: return "up"
+        case .dpadDown: return "down"
+        case .dpadLeft: return "left"
+        case .dpadRight: return "right"
+        case .zl: return "zl"
+        case .zr: return "zr"
+        }
+    }
+
+    static let allNames = AMButton.allCases.map(\.name).joined(separator: " ")
+
+    // 用户在 config.env 里写的名字（Switch 标签）；A/B/X/Y 按 Astris 的 useNintendoLayout 换算见 AMBindings.physical
+    static let aliases: [String: AMButton] = [
+        "a": .a, "b": .b, "x": .x, "y": .y,
+        "minus": .minus, "-": .minus, "select": .minus,
+        "plus": .plus, "+": .plus, "start": .plus,
+        "home": .home,
+        "l": .l, "lb": .l, "l1": .l,
+        "r": .r, "rb": .r, "r1": .r,
+        "zl": .zl, "lt": .zl, "l2": .zl,
+        "zr": .zr, "rt": .zr, "r2": .zr,
+        "lstick": .leftStick, "leftstick": .leftStick, "ls": .leftStick, "l3": .leftStick,
+        "rstick": .rightStick, "rightstick": .rightStick, "rs": .rightStick, "r3": .rightStick,
+        "up": .dpadUp, "dpadup": .dpadUp, "dup": .dpadUp,
+        "down": .dpadDown, "dpaddown": .dpadDown, "ddown": .dpadDown,
+        "left": .dpadLeft, "dpadleft": .dpadLeft, "dleft": .dpadLeft,
+        "right": .dpadRight, "dpadright": .dpadRight, "dright": .dpadRight,
+    ]
+
+    static func parse(_ spec: String) -> AMButton? {
+        let s = spec.lowercased().trimmingCharacters(in: .whitespaces)
+        if let direct = aliases[s] { return direct }
+        return aliases[s.filter { !"-_ ".contains($0) }]
+    }
 }
 
 struct AMStickKeys {
@@ -320,6 +394,18 @@ struct AMBindings {
         return camel
     }
 
+    // Switch 标签 → 送给 C API 的按钮：libryujinx 在 useNintendoLayout 时把 A/B、X/Y 对调
+    func physical(_ button: AMButton) -> AMButton {
+        guard useNintendoLayout else { return button }
+        switch button {
+        case .a: return .b
+        case .b: return .a
+        case .x: return .y
+        case .y: return .x
+        default: return button
+        }
+    }
+
     var player1Status: String {
         switch (backend, takeover) {
         case ("Invalid", _):
@@ -379,6 +465,7 @@ final class AMState {
     var toggleKeyDown = false
     var connectFailureLogged = false
     var optionsShapeLogged = false
+    var mouseHeld = Set<Int>()      // 平移中被我们吞掉 mouseDown 的鼠标键号
 
     var frontendRight: (x: Float, y: Float) = (0, 0)
     var samples: [(t: Double, dx: Double, dy: Double)] = []
@@ -409,6 +496,9 @@ final class AMState {
     }
 
     var usingPhysical: Bool { physical[bindings.controllerId] != nil }
+
+    // 键盘键只转发给虚拟手柄；鼠标键发往真手柄时不能把键盘状态算进去，否则松开鼠标后按钮会卡住
+    var mouseTargetKeys: Set<Int32> { handle == virtualHandle ? keysDown : [] }
 }
 
 // MARK: - 虚拟手柄生命周期
@@ -428,7 +518,7 @@ func amEnsureVirtualGamepad(reason: String) {
         s.connectFailureLogged = false
         s.lock.unlock()
         amLog("virtual gamepad \"\(id)\" connected as controller \(h) (\(reason))")
-        amPushKeyboardState()
+        amPushInputState()
     } else if !s.connectFailureLogged {
         s.connectFailureLogged = true
         amLog("virtual gamepad \"\(id)\" connect failed (\(reason)); will keep retrying every 2s")
@@ -466,7 +556,7 @@ private func amApplyBindings(_ fresh: AMBindings) {
     if fresh.backend != old.backend || fresh.takeover != old.takeover || fresh.controllerId != old.controllerId {
         amLog(fresh.player1Status)
     }
-    amPushKeyboardState()
+    amPushInputState()
     if fresh.controllerId != old.controllerId {
         // 旧 id 的虚拟手柄要先摘掉，否则 libryujinx 里会留下一个没人用的手柄
         s.lock.lock()
@@ -517,25 +607,127 @@ public func amRewriteOptions(_ json: UnsafePointer<CChar>?) -> UnsafeMutablePoin
     return strdup(text)
 }
 
-// MARK: - 键盘 → 虚拟手柄
+// MARK: - 键盘 / 鼠标键 → 虚拟手柄
 
-private func amPushKeyboardState() {
+// 同一个手柄按钮可能同时被键盘键和鼠标键绑定，任一按着就算按下
+private func amButtonState(_ button: AMButton, cfg: AMConfig, bindings: AMBindings,
+                           keysDown: Set<Int32>, mouseHeld: Set<Int>) -> Int32 {
+    if keysDown.contains(where: { bindings.buttons[$0] == button }) { return 1 }
+    if mouseHeld.contains(where: { cfg.mouseButtons[$0].map(bindings.physical) == button }) { return 1 }
+    return 0
+}
+
+private func amPushInputState() {
     let s = AMState.shared
     s.lock.lock()
     let h = s.virtualHandle
+    let cfg = s.cfg
     let b = s.bindings
     let keys = s.keysDown
+    let mouse = s.mouseHeld
     let active = s.active
     s.lock.unlock()
     guard h >= 0 else { return }
-    for (key, button) in b.buttons {
-        ryujinx_set_controller_button_pressed(h, button.rawValue, keys.contains(key) ? 1 : 0)
+    let buttons = Set(b.buttons.values).union(cfg.mouseButtons.values.map(b.physical))
+    for button in buttons {
+        ryujinx_set_controller_button_pressed(
+            h, button.rawValue, amButtonState(button, cfg: cfg, bindings: b, keysDown: keys, mouseHeld: mouse))
     }
     let left = b.leftStick.value(keys)
     ryujinx_set_controller_stick_axis(h, 0, left.x, left.y)
     if !active {
         let right = b.rightStick.value(keys)
         ryujinx_set_controller_stick_axis(h, 1, right.x, right.y)
+    }
+}
+
+// MARK: - 鼠标键 → 手柄按钮（主线程）
+
+// 平移开启时，绑定了的鼠标键按下/抬起转成手柄按钮并吞掉事件；没绑定的照常交给 Astris。
+// 抬起只吞我们吞过按下的那一次，避免 Astris 收到有头无尾的点击。
+private func amHandleMouseButton(_ event: NSEvent) -> NSEvent? {
+    let s = AMState.shared
+    let number = Int(event.buttonNumber)
+    let isDown = event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown
+    let cfg = s.cfg
+
+    if isDown {
+        guard s.active, let bound = cfg.mouseButtons[number] else { return event }
+        s.lock.lock()
+        s.mouseHeld.insert(number)
+        s.lock.unlock()
+        amSendMouseButton(number, bound, down: true)
+        return nil
+    }
+
+    s.lock.lock()
+    let swallowed = s.mouseHeld.remove(number) != nil
+    s.lock.unlock()
+    guard swallowed else { return event }
+    if let bound = cfg.mouseButtons[number] {
+        amSendMouseButton(number, bound, down: false)
+    }
+    return nil
+}
+
+private func amSendMouseButton(_ number: Int, _ bound: AMButton, down: Bool) {
+    let s = AMState.shared
+    s.lock.lock()
+    let handle = s.handle
+    let cfg = s.cfg
+    let b = s.bindings
+    let keys = s.mouseTargetKeys
+    let mouse = s.mouseHeld
+    s.lock.unlock()
+    guard let handle else { return }
+    let button = b.physical(bound)
+    let state = amButtonState(button, cfg: cfg, bindings: b, keysDown: keys, mouseHeld: mouse)
+    ryujinx_set_controller_button_pressed(handle, button.rawValue, state)
+    if cfg.debug {
+        amLog("mouse \(AMConfig.mouseButtonLabel(number)) \(down ? "down" : "up") -> \(bound.name)\(button == bound ? "" : "(\(button.name))") pressed=\(state) controller \(handle)")
+    }
+}
+
+// 绑定热更新时，正按着的鼠标键：旧按钮按新状态重算（通常是松开），新按钮按下
+private func amResyncMouseButtons(previous old: AMConfig) {
+    let s = AMState.shared
+    s.lock.lock()
+    let handle = s.handle
+    let cfg = s.cfg
+    let b = s.bindings
+    let keys = s.mouseTargetKeys
+    let mouse = s.mouseHeld
+    s.lock.unlock()
+    guard let handle, !mouse.isEmpty else { return }
+    var affected = Set<AMButton>()
+    for number in mouse {
+        if let o = old.mouseButtons[number] { affected.insert(b.physical(o)) }
+        if let n = cfg.mouseButtons[number] { affected.insert(b.physical(n)) }
+    }
+    for button in affected {
+        let state = amButtonState(button, cfg: cfg, bindings: b, keysDown: keys, mouseHeld: mouse)
+        ryujinx_set_controller_button_pressed(handle, button.rawValue, state)
+        if cfg.debug { amLog("mouse rebind -> \(button.name) pressed=\(state) controller \(handle)") }
+    }
+}
+
+// 平移停止时松开鼠标按着的手柄按钮：之后的 mouseUp 会直接交给 Astris，收不到也不会卡住
+private func amReleaseMouseButtons() {
+    let s = AMState.shared
+    s.lock.lock()
+    let held = s.mouseHeld
+    s.mouseHeld.removeAll()
+    let handle = s.handle
+    let cfg = s.cfg
+    let b = s.bindings
+    let keys = s.mouseTargetKeys
+    s.lock.unlock()
+    guard let handle, !held.isEmpty else { return }
+    for number in held {
+        guard let bound = cfg.mouseButtons[number] else { continue }
+        let button = b.physical(bound)
+        let state = amButtonState(button, cfg: cfg, bindings: b, keysDown: keys, mouseHeld: [])
+        ryujinx_set_controller_button_pressed(handle, button.rawValue, state)
     }
 }
 
@@ -654,16 +846,18 @@ public func amOnKeyboardKeyPressed(_ key: Int32, _ pressed: Int32) -> Bool {
     let h = s.virtualHandle
     let b = s.bindings
     let keys = s.keysDown
+    let mouse = s.mouseHeld
     let active = s.active
-    let debug = s.cfg.debug
+    let debug = cfg.debug
     s.lock.unlock()
     if debug {
         amLog("frontend keyboard_key_pressed(key=\(key), pressed=\(pressed))")
     }
     guard h >= 0 else { return false }
     if let button = b.buttons[key] {
-        ryujinx_set_controller_button_pressed(h, button.rawValue, pressed != 0 ? 1 : 0)
-        if debug { amLog("emu button \(button) pressed=\(pressed) -> controller \(h)") }
+        let state = amButtonState(button, cfg: cfg, bindings: b, keysDown: keys, mouseHeld: mouse)
+        ryujinx_set_controller_button_pressed(h, button.rawValue, state)
+        if debug { amLog("emu button \(button.name) pressed=\(state) -> controller \(h)") }
     }
     if b.leftStick.contains(key) {
         let v = b.leftStick.value(keys)
@@ -712,6 +906,13 @@ func amInstall() {
             amAccumulate(dx: event.deltaX, dy: event.deltaY)
             return nil
         }
+    ) {
+        s.monitors.append(m)
+    }
+
+    if let m = NSEvent.addLocalMonitorForEvents(
+        matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp],
+        handler: { event in amHandleMouseButton(event) }
     ) {
         s.monitors.append(m)
     }
@@ -806,6 +1007,9 @@ private func amApplyConfigFile(_ text: String, path: String) {
 
     if requestedTakeover != old.takeover {
         amLog("config: ASTRIS_MOUSE_TAKEOVER 只在启动时生效，本次沿用 \(old.takeover)，重启后按新值")
+    }
+    if fresh.mouseButtons != old.mouseButtons {
+        amResyncMouseButtons(previous: old)
     }
     let changes = fresh.changes(from: old)
     let name = (path as NSString).lastPathComponent
@@ -916,6 +1120,7 @@ func amStop(reason: String) {
         ryujinx_set_controller_stick_axis(handle, 1, restore.x, restore.y)
     }
     s.lastSent = restore
+    amReleaseMouseButtons()
 
     if s.cfg.sound { NSSound(named: "Pop")?.play() }
     amLog("panning OFF (\(reason)) moves=\(stats.0) sends=\(stats.1) swallowedFrontend=\(stats.2)")
@@ -1012,7 +1217,7 @@ private func amSend(_ v: (x: Float, y: Float)) {
 private func amProbe() {
     let s = AMState.shared
     s.lock.lock()
-    let summary = "probe: active=\(s.active) controller=\(s.handle.map(String.init) ?? "none") virtual=\(s.virtualHandle) physical=\(s.physical) keysDown=\(s.keysDown.sorted()) frontendRight=\(s.frontendRight) frontendCalls(stick=\(s.frontendStickCalls) button=\(s.frontendButtonCalls) keyboard=\(s.frontendKeyboardCalls)) moves=\(s.moves) sends=\(s.sends) swallowed=\(s.swallowed)"
+    let summary = "probe: active=\(s.active) controller=\(s.handle.map(String.init) ?? "none") virtual=\(s.virtualHandle) physical=\(s.physical) keysDown=\(s.keysDown.sorted()) mouseHeld=\(s.mouseHeld.sorted()) frontendRight=\(s.frontendRight) frontendCalls(stick=\(s.frontendStickCalls) button=\(s.frontendButtonCalls) keyboard=\(s.frontendKeyboardCalls)) moves=\(s.moves) sends=\(s.sends) swallowed=\(s.swallowed)"
     s.lock.unlock()
     amLog(summary)
     amLog("probe: isActive=\(NSApp.isActive) keyWindow=\"\(NSApp.keyWindow?.title ?? "nil")\" firstResponder=\(NSApp.keyWindow?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil") windows=\(NSApp.windows.filter { $0.isVisible }.map { $0.title })")
@@ -1087,6 +1292,7 @@ private func amDiag() {
     amLog("diag: \(b.player1Status)")
     amLog("diag: keyCode->button: \(keys)")
     amLog("diag: stick keys: \(sticks)")
+    amLog("diag: mouse buttons: \(s.cfg.mouseButtonsDescription)\(b.useNintendoLayout ? " (nintendo layout: a/b, x/y swapped on send)" : "")")
 }
 
 // MARK: - 入口

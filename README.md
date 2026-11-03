@@ -12,6 +12,7 @@ Mouse-to-key tools such as [MacRMB](https://github.com/ikoshura/MacRMB) turn the
 ## Features
 
 - **Analog right stick**: mouse movement is filtered and mapped to continuous stick deflection, updated every display frame.
+- **Mouse buttons as controller buttons**: bind left, right, middle, and the two side buttons to any controller button (for example left → ZL, right → ZR). Active only while panning, so clicks work normally in menus.
 - **Works with Player 1 set to Keyboard**: the common Astris setup (Player 1 → Keyboard) is taken over transparently. The configuration handed to `libryujinx` is rewritten in memory so Player 1 becomes the virtual controller; Astris's own settings and preference file are left untouched.
 - **Keyboard keeps working**: Player 1's key bindings from Astris's input settings are forwarded to the virtual controller, and edits there take effect immediately.
 - **Real controllers take priority**: when Player 1 is set to a gamepad in Astris and that physical controller connects, the virtual controller steps aside and the mouse drives the physical controller's right stick. The virtual controller comes back when the physical one disconnects.
@@ -65,6 +66,7 @@ To try a value for a single launch, pass it inline, e.g. `ASTRIS_MOUSE_FULL_SPEE
 | `ASTRIS_MOUSE_ANTI_DEADZONE` | `0.10` | Non-zero output starts at this magnitude. Match it to Astris's right-stick deadzone (0.1 by default) so small movements still register. |
 | `ASTRIS_MOUSE_OUTPUT_DEADZONE` | `0.02` | Output below this magnitude is sent as zero to prevent drift. |
 | `ASTRIS_MOUSE_INVERT_Y` | `0` | Invert the vertical axis. |
+| `ASTRIS_MOUSE_BUTTON_LEFT` / `_RIGHT` / `_MIDDLE` / `_4` / `_5` | unbound | Controller button sent while the mouse button is held during panning. Names: `a b x y minus plus home l r zl zr lstick rstick up down left right` (aliases such as `lt`/`rt`, `l2`/`r2`, `l3`/`r3`, `select`/`start` also work); `none` unbinds. `_4`/`_5` are the side (back/forward) buttons. A/B/X/Y follow the Switch labels, matching Astris's *Nintendo layout* setting. |
 | `ASTRIS_MOUSE_TOGGLE` | `cmd+alt+m` | Toggle hotkey. Modifiers: `cmd`, `alt`, `ctrl`, `shift`. Keys: `a`–`z`, `0`–`9`, `f1`–`f15`, `space`, `tab`, `esc`, `return`, or a raw key code. |
 | `ASTRIS_MOUSE_SOUND` | `1` | Play a sound when panning starts and stops. |
 | `ASTRIS_MOUSE_CONTROLLER` | auto | Force a specific libryujinx controller handle. Rarely needed. |
@@ -89,6 +91,7 @@ Key bindings are not configured here; they are read from Astris's own input sett
   ```
 - **Panning toggles but the camera does not move**: Player 1 is not bound to the virtual controller. Look for `Configured Keyboard for Player1` or `Gamepad ID '...' requested for Player1 but not found` in the log. Make sure `ASTRIS_MOUSE_TAKEOVER` is not `0`, and that Player 1 is not set to *Invalid* in Astris's input settings.
 - **Vertical look is inverted**: set `ASTRIS_MOUSE_INVERT_Y=1`.
+- **A bound mouse button does nothing or drops while held**: mouse button bindings only apply while panning is on, so toggle it first; then check the log for `ASTRIS_MOUSE_BUTTON_... 无法识别` (unknown button name). Remapping tools such as Karabiner-Elements or BetterTouchTool may turn a held right button into something else before Astris sees it; add an exception for Astris (bundle ID `V380-Ori.Astris`) in that tool.
 - **Edits to `config.env` are not picked up**: the log should contain `config: live reload on, watching .../config.env` from this launch and a `[astris-launch] sent ...` line after each save. If it does not, the instance was started with an older build; quit Astris and run `./run.sh` again.
 - **The build cannot find `libryujinx.dylib`**: point `ASTRIS_APP` at your `Astris.app`.
 - **Anything else**: launch with `ASTRIS_MOUSE_DEBUG=1 ./run.sh`, reproduce the problem, and attach `~/Library/Logs/AstrisMouse.log` to an issue.
