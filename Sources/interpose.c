@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "bridge.h"
 #include "callbacks.h"
 
@@ -46,6 +48,15 @@ static int32_t am_stop_emulation(void) {
     return ryujinx_stop_emulation();
 }
 
+// 前端把整份 RyujinxOptions JSON 交给 libryujinx；需要时把 Player1 改写成绑定我们的虚拟手柄。
+// 只改内存里这一份字符串，Astris 自己的设置和偏好文件不动。
+static void am_update_options(const char *json) {
+    char *patched = am_rewrite_options(json);
+    ryujinx_update_options(patched ? patched : json);
+    free(patched);
+}
+
+DYLD_INTERPOSE(am_update_options, ryujinx_update_options)
 DYLD_INTERPOSE(am_stop_emulation, ryujinx_stop_emulation)
 DYLD_INTERPOSE(am_stick_axis, ryujinx_set_controller_stick_axis)
 DYLD_INTERPOSE(am_button_pressed, ryujinx_set_controller_button_pressed)

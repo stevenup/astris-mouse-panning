@@ -31,6 +31,7 @@ struct AMConfig {
     var toggleModifiers: NSEvent.ModifierFlags = [.command, .option]
     var toggleDescription = "cmd+alt+m"
     var controllerOverride: Int32?
+    var takeover = true            // Player1 不是手柄后端时，改写传给 libryujinx 的配置让它绑定虚拟手柄
     var debug = false
     var sound = true
 
@@ -63,6 +64,7 @@ struct AMConfig {
         if let v = flag("ASTRIS_MOUSE_INVERT_Y") { c.invertY = v }
         if let v = flag("ASTRIS_MOUSE_DEBUG") { c.debug = v }
         if let v = flag("ASTRIS_MOUSE_SOUND") { c.sound = v }
+        if let v = flag("ASTRIS_MOUSE_TAKEOVER") { c.takeover = v }
         if let v = num("ASTRIS_MOUSE_CONTROLLER") { c.controllerOverride = Int32(v) }
         if let spec = env["ASTRIS_MOUSE_TOGGLE"]?.lowercased(), !spec.isEmpty {
             var mods: NSEvent.ModifierFlags = []
@@ -113,7 +115,12 @@ struct AMStickKeys {
 }
 
 struct AMBindings {
+    // Player1 不是手柄后端时，虚拟手柄用这个独立 id 注册，避免和物理手柄撞名
+    static let takeoverId = "AstrisMouse"
+
     var controllerId = "Pro Controller"
+    var backend = "unknown"          // Astris 的 Player1 backend：Invalid / WindowKeyboard / Gamepad
+    var takeover = false             // 是否需要把 Player1 改写成绑定虚拟手柄
     var useNintendoLayout = false
     var buttons: [Int32: AMButton] = [:]
     var leftStick = AMStickKeys()
@@ -141,18 +148,42 @@ struct AMBindings {
         "KeypadMultiply": 67, "KeypadSubtract": 78, "KeypadAdd": 69, "KeypadDecimal": 65, "KeypadEnter": 76,
     ]
 
-    static func load() -> AMBindings {
-        var b = AMBindings()
+    static func player1(in root: [String: Any]) -> [String: Any]? {
+        guard let players = root["playerInputConfig"] as? [[String: Any]] else { return nil }
+        return players.first(where: { ($0["playerIndex"] as? String) == "Player1" }) ?? players.first
+    }
+
+    static func load(takeoverEnabled: Bool) -> AMBindings {
         guard let data = UserDefaults.standard.data(forKey: "RyujinxOptions"),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let players = root["playerInputConfig"] as? [[String: Any]],
-              let p1 = players.first(where: { ($0["playerIndex"] as? String) == "Player1" }) ?? players.first
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
+            let b = AMBindings()
             amLog("bindings: RyujinxOptions 不可读，使用默认 controllerId=\"\(b.controllerId)\"，键盘映射为空")
             return b
         }
-        b.source = "prefs"
-        if let id = p1["controllerId"] as? String, !id.isEmpty { b.controllerId = id }
+        return parse(root, source: "prefs", takeoverEnabled: takeoverEnabled)
+    }
+
+    static func parse(_ root: [String: Any], source: String, takeoverEnabled: Bool) -> AMBindings {
+        var b = AMBindings()
+        guard let p1 = player1(in: root) else {
+            amLog("bindings(\(source)): 找不到 playerInputConfig，使用默认 controllerId=\"\(b.controllerId)\"")
+            return b
+        }
+        b.source = source
+        b.backend = (p1["backend"] as? String) ?? "missing"
+        let configuredId = (p1["controllerId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        switch b.backend {
+        case "Gamepad" where configuredId != nil:
+            b.controllerId = configuredId!
+        case "Invalid":
+            b.controllerId = configuredId ?? AMBindings.takeoverId
+        default:
+            // WindowKeyboard，或 Gamepad 但没选手柄：libryujinx 只会给 Player1 配键盘，
+            // 需要我们把它改写成绑定虚拟手柄，键盘再由我们转成手柄按键
+            b.takeover = takeoverEnabled
+            b.controllerId = takeoverEnabled ? AMBindings.takeoverId : (configuredId ?? "Pro Controller")
+        }
         b.useNintendoLayout = (p1["useNintendoLayout"] as? Bool) ?? false
 
         func key(_ section: String, _ field: String) -> Int32? {
@@ -188,14 +219,40 @@ struct AMBindings {
         return b
     }
 
-    var summary: String {
-        "controllerId=\"\(controllerId)\" nintendoLayout=\(useNintendoLayout) buttons=\(buttons.count) leftStickKeys=\(leftStick.up != nil) rightStickKeys=\(rightStick.up != nil) source=\(source)"
+    // 需要接管时返回改写后的整份配置：Player1 → Gamepad + 虚拟手柄 id，其余字段原样保留
+    func rewrittenOptions(_ root: [String: Any]) -> [String: Any]? {
+        guard takeover, var players = root["playerInputConfig"] as? [[String: Any]],
+              let idx = players.firstIndex(where: { ($0["playerIndex"] as? String) == "Player1" })
+        else { return nil }
+        players[idx]["backend"] = "Gamepad"
+        players[idx]["controllerId"] = AMBindings.takeoverId
+        var out = root
+        out["playerInputConfig"] = players
+        return out
     }
 
+    var player1Status: String {
+        switch (backend, takeover) {
+        case ("Invalid", _):
+            return "warning: Astris 里 Player1 的输入是 Invalid（未启用），鼠标和键盘都进不了游戏；请在 Astris 设置里把 Player1 设为 Keyboard 或 Gamepad"
+        case (_, true):
+            return "Player1 在 Astris 里是 \(backend)，注入后改写为 Gamepad/\"\(AMBindings.takeoverId)\"（只改本进程交给 libryujinx 的配置，Astris 设置文件不变）"
+        case ("Gamepad", false):
+            return "Player1 在 Astris 里是 Gamepad controllerId=\"\(controllerId)\"，沿用；没有同名物理手柄时由虚拟手柄顶替"
+        default:
+            return "Player1 在 Astris 里是 \(backend)，未接管（ASTRIS_MOUSE_TAKEOVER=0），鼠标不会生效"
+        }
+    }
+
+    var summary: String {
+        "controllerId=\"\(controllerId)\" backend=\(backend) takeover=\(takeover) nintendoLayout=\(useNintendoLayout) buttons=\(buttons.count) leftStickKeys=\(leftStick.up != nil) rightStickKeys=\(rightStick.up != nil) source=\(source)"
+    }
+
+    // 不含 source：同一份配置不管来自偏好还是 update_options 都算相同
     var signature: String {
         let keys = buttons.map { "\($0.key)->\($0.value)" }.sorted().joined(separator: " ")
         let sticks = "\(leftStick.up ?? -1),\(leftStick.down ?? -1),\(leftStick.left ?? -1),\(leftStick.right ?? -1)|\(rightStick.up ?? -1),\(rightStick.down ?? -1),\(rightStick.left ?? -1),\(rightStick.right ?? -1)"
-        return "\(summary) \(keys) \(sticks)"
+        return "\(controllerId)|\(backend)|\(takeover)|\(useNintendoLayout) \(keys) \(sticks)"
     }
 }
 
@@ -205,8 +262,13 @@ final class AMState {
     static let shared = AMState()
 
     let lock = NSLock()
-    var cfg = AMConfig.load()
-    var bindings = AMBindings.load()
+    let cfg: AMConfig
+    var bindings: AMBindings
+
+    private init() {
+        cfg = AMConfig.load()
+        bindings = AMBindings.load(takeoverEnabled: cfg.takeover)
+    }
 
     var installed = false
     var active = false
@@ -285,19 +347,54 @@ func amReleaseVirtualGamepad(reason: String) {
 
 private func amReloadBindings() {
     let s = AMState.shared
-    let fresh = AMBindings.load()
+    amApplyBindings(AMBindings.load(takeoverEnabled: s.cfg.takeover))
+}
+
+private func amApplyBindings(_ fresh: AMBindings) {
+    let s = AMState.shared
     s.lock.lock()
-    let oldId = s.bindings.controllerId
-    let changed = fresh.signature != s.bindings.signature
+    let old = s.bindings
+    let changed = fresh.signature != old.signature
     s.bindings = fresh
     s.lock.unlock()
     guard changed else { return }
     amLog("bindings reloaded: \(fresh.summary)")
+    if fresh.backend != old.backend || fresh.takeover != old.takeover || fresh.controllerId != old.controllerId {
+        amLog(fresh.player1Status)
+    }
     amPushKeyboardState()
-    if fresh.controllerId != oldId {
-        amReleaseVirtualGamepad(reason: "controllerId changed \(oldId) -> \(fresh.controllerId)")
+    if fresh.controllerId != old.controllerId {
+        // 旧 id 的虚拟手柄要先摘掉，否则 libryujinx 里会留下一个没人用的手柄
+        s.lock.lock()
+        let h = s.virtualHandle
+        s.virtualHandle = -1
+        s.lock.unlock()
+        if h >= 0 {
+            ryujinx_disconnect_controller(old.controllerId)
+            amLog("virtual gamepad \"\(old.controllerId)\" (controller \(h)) disconnected (controllerId changed -> \"\(fresh.controllerId)\")")
+        }
         amEnsureVirtualGamepad(reason: "controllerId changed")
     }
+}
+
+// 前端每次把 RyujinxOptions 交给 libryujinx 都会经过这里（启动、改设置）
+@_cdecl("am_rewrite_options")
+public func amRewriteOptions(_ json: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+    guard let json else { return nil }
+    let s = AMState.shared
+    let data = Data(bytes: json, count: strlen(json))
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        amLog("options: 前端传给 libryujinx 的 JSON 无法解析，原样放行")
+        return nil
+    }
+    let fresh = AMBindings.parse(root, source: "update_options", takeoverEnabled: s.cfg.takeover)
+    amApplyBindings(fresh)
+    guard let patched = fresh.rewrittenOptions(root),
+          let out = try? JSONSerialization.data(withJSONObject: patched),
+          let text = String(data: out, encoding: .utf8)
+    else { return nil }
+    if s.cfg.debug { amLog("options: Player1 rewritten (\(data.count) -> \(out.count) bytes)") }
+    return strdup(text)
 }
 
 // MARK: - 键盘 → 虚拟手柄
@@ -524,6 +621,7 @@ func amInstall() {
 
     amLog("installed: toggle=\(cfg.toggleDescription) fullSpeed=\(cfg.fullSpeed)pt/s curve=\(cfg.curve) smoothing=\(Int(cfg.smoothingTau * 1000))ms window=\(Int(cfg.window * 1000))ms antiDeadzone=\(cfg.antiDeadzone) invertY=\(cfg.invertY) controller=\(cfg.controllerOverride.map(String.init) ?? "auto") debug=\(cfg.debug)")
     amLog("bindings: \(s.bindings.summary)")
+    amLog(s.bindings.player1Status)
 }
 
 private func amRegisterNotification(_ name: String, _ handler: @escaping () -> Void) {
@@ -561,6 +659,9 @@ func amStart(reason: String) {
     amEnsureVirtualGamepad(reason: "panning ON")
     if s.handle == nil {
         amLog("warning: no controller handle yet; mouse input will be ignored until one appears")
+    }
+    if s.bindings.backend != "Gamepad" && !s.bindings.takeover {
+        amLog(s.bindings.player1Status)
     }
 
     s.pinnedWindow = window
@@ -789,6 +890,7 @@ private func amDiag() {
     let sticks = "left(up=\(b.leftStick.up ?? -1) down=\(b.leftStick.down ?? -1) left=\(b.leftStick.left ?? -1) right=\(b.leftStick.right ?? -1)) right(up=\(b.rightStick.up ?? -1) down=\(b.rightStick.down ?? -1) left=\(b.rightStick.left ?? -1) right=\(b.rightStick.right ?? -1))"
     s.lock.unlock()
     amLog(line)
+    amLog("diag: \(b.player1Status)")
     amLog("diag: keyCode->button: \(keys)")
     amLog("diag: stick keys: \(sticks)")
 }

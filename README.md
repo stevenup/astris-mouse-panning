@@ -12,8 +12,9 @@ Mouse-to-key tools such as [MacRMB](https://github.com/ikoshura/MacRMB) turn the
 ## Features
 
 - **Analog right stick**: mouse movement is filtered and mapped to continuous stick deflection, updated every display frame.
+- **Works with Player 1 set to Keyboard**: the common Astris setup (Player 1 → Keyboard) is taken over transparently. The configuration handed to `libryujinx` is rewritten in memory so Player 1 becomes the virtual controller; Astris's own settings and preference file are left untouched.
 - **Keyboard keeps working**: Player 1's key bindings from Astris's input settings are forwarded to the virtual controller, and edits there take effect immediately.
-- **Real controllers take priority**: when Astris connects a physical controller whose ID matches Player 1, the virtual controller steps aside and the mouse drives the physical controller's right stick. The virtual controller comes back when the physical one disconnects.
+- **Real controllers take priority**: when Player 1 is set to a gamepad in Astris and that physical controller connects, the virtual controller steps aside and the mouse drives the physical controller's right stick. The virtual controller comes back when the physical one disconnects.
 - **Fully reversible**: nothing inside `Astris.app` is modified. Only the instance launched with `run.sh` is injected; opening Astris the usual way gives you the stock app.
 - **No extra permissions**: everything runs inside the Astris process, so no Accessibility or Input Monitoring permission is required.
 
@@ -65,6 +66,7 @@ Copy `config.env.example` to `config.env`, uncomment the lines you want to chang
 | `ASTRIS_MOUSE_TOGGLE` | `cmd+alt+m` | Toggle hotkey. Modifiers: `cmd`, `alt`, `ctrl`, `shift`. Keys: `a`–`z`, `0`–`9`, `f1`–`f15`, `space`, `tab`, `esc`, `return`, or a raw key code. |
 | `ASTRIS_MOUSE_SOUND` | `1` | Play a sound when panning starts and stops. |
 | `ASTRIS_MOUSE_CONTROLLER` | auto | Force a specific libryujinx controller handle. Rarely needed. |
+| `ASTRIS_MOUSE_TAKEOVER` | `1` | When Player 1 is set to Keyboard in Astris (or to a gamepad with no controller selected), rewrite the in-memory config so Player 1 binds to the virtual controller. Set to `0` to leave Player 1 exactly as configured; the mouse then only works if Player 1 is a gamepad. |
 | `ASTRIS_MOUSE_DEBUG` | `0` | Log every input call from Astris and every value this tool sends. |
 
 Options for `run.sh` and `build.sh`:
@@ -79,10 +81,11 @@ Key bindings are not configured here; they are read from Astris's own input sett
 - **⌥⌘M does nothing**: the hotkey only works while Astris is the frontmost app, so click the game window first. `notifyutil -p dev.astrismouse.toggle` works regardless of focus.
 - **Is the injection working?** The log should contain lines like:
   ```
-  virtual gamepad "Pro Controller" connected as controller 0 (startup)
+  virtual gamepad "AstrisMouse" connected as controller 0 (startup)
   Application ConfigureInputs: Configured Gamepad 'AstrisMouse' for Player1   ← when a game starts
   panning ON (...) controller=0 virtual window="..."                         ← after ⌥⌘M
   ```
+- **Panning toggles but the camera does not move**: Player 1 is not bound to the virtual controller. Look for `Configured Keyboard for Player1` or `Gamepad ID '...' requested for Player1 but not found` in the log. Make sure `ASTRIS_MOUSE_TAKEOVER` is not `0`, and that Player 1 is not set to *Invalid* in Astris's input settings.
 - **Vertical look is inverted**: set `ASTRIS_MOUSE_INVERT_Y=1`.
 - **The build cannot find `libryujinx.dylib`**: point `ASTRIS_APP` at your `Astris.app`.
 - **Anything else**: launch with `ASTRIS_MOUSE_DEBUG=1 ./run.sh`, reproduce the problem, and attach `~/Library/Logs/AstrisMouse.log` to an issue.
@@ -95,9 +98,9 @@ Key bindings are not configured here; they are read from Astris's own input sett
 ## How it works
 
 1. `run.sh` starts Astris through `build/astris-launch`, which sets `DYLD_INSERT_LIBRARIES` only for the Astris process. Astris's code-signing entitlements (`com.apple.security.cs.allow-dyld-environment-variables` and `com.apple.security.cs.disable-library-validation`) allow this without re-signing.
-2. `libAstrisMouse.dylib` uses dyld interposing to intercept Astris's calls into `libryujinx`: controller connect and disconnect, stick, button, keyboard, and `stop_emulation`.
-3. It calls `ryujinx_connect_controller` with Player 1's `controllerId` (usually `Pro Controller`), so Player 1 binds to the virtual controller.
-4. Once Player 1 is a gamepad, Astris stops mapping the keyboard to it, so the dylib reads Player 1's key bindings from Astris's preferences and forwards them to the virtual controller's sticks and buttons.
+2. `libAstrisMouse.dylib` uses dyld interposing to intercept Astris's calls into `libryujinx`: `update_options`, controller connect and disconnect, stick, button, keyboard, and `stop_emulation`.
+3. Astris passes its whole settings JSON to `ryujinx_update_options`. If Player 1 is set to Keyboard there, the dylib rewrites that one entry to `backend: Gamepad, controllerId: AstrisMouse` before forwarding it, then calls `ryujinx_connect_controller("AstrisMouse", ...)`, so Player 1 binds to the virtual controller. If Player 1 is already a gamepad, the config is forwarded unchanged and the virtual controller registers under that gamepad's ID so it fills in when no physical controller is present.
+4. Once Player 1 is a gamepad, `libryujinx` stops mapping the keyboard to it, so the dylib reads Player 1's key bindings from the same config and forwards them to the virtual controller's sticks and buttons.
 5. While panning is on, the cursor is hidden and decoupled from the mouse. On every display frame, recent mouse deltas are converted to a velocity, shaped by the response curve, low-pass filtered, offset past the deadzone, and written to the right stick with `ryujinx_set_controller_stick_axis`.
 
 ## Development
@@ -122,6 +125,7 @@ These signatures were recovered by disassembling Astris 1.0.32 (arm64) and may d
 - `void ryujinx_set_controller_stick_axis(int32 controller, int32 stick, float x, float y)`: stick 0 is left and 1 is right; positive y is up; values range from -1 to 1.
 - `void ryujinx_set_controller_button_pressed(int32 controller, int32 button, int32 pressed)`: buttons 0–16 are A, B, X, Y, Minus, Home, Plus, LStick, RStick, L, R, DpadUp, DpadDown, DpadLeft, DpadRight, ZL, ZR.
 - `void ryujinx_set_keyboard_key_pressed(int32 macKeyCode, int32 pressed)`
+- `void ryujinx_update_options(const char *json)`: takes the same JSON that Astris stores under the `RyujinxOptions` preference key; `playerInputConfig[].backend` is `Invalid`, `WindowKeyboard`, or `Gamepad`. When emulation is running and the input section changed, `libryujinx` reconfigures players immediately.
 - `ryujinx_start_emulation(const char *path)` / `ryujinx_stop_emulation(void)`
 
 ## License

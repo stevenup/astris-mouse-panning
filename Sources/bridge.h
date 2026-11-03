@@ -13,5 +13,6 @@ int32_t ryujinx_connect_controller(const char *id, const char *name);
 void    ryujinx_disconnect_controller(const char *id);
 void    ryujinx_set_keyboard_key_pressed(int32_t key, int32_t pressed);
 int32_t ryujinx_stop_emulation(void);
+void    ryujinx_update_options(const char *json);
 
 #endif
