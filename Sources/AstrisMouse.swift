@@ -114,6 +114,24 @@ struct AMStickKeys {
     }
 }
 
+// Astris 存偏好用 camelCase（playerInputConfig），交给 libryujinx 时用 snake_case（player_input_config），
+// 这里按去掉下划线后不分大小写的形式查键，两种写法一视同仁
+private func amKeyForm(_ key: String) -> String {
+    key.lowercased().replacingOccurrences(of: "_", with: "")
+}
+
+extension Dictionary where Key == String, Value == Any {
+    func amKey(_ name: String) -> String? {
+        if self[name] != nil { return name }
+        let want = amKeyForm(name)
+        return keys.first { amKeyForm($0) == want }
+    }
+
+    subscript(am name: String) -> Any? {
+        amKey(name).flatMap { self[$0] }
+    }
+}
+
 struct AMBindings {
     // Player1 不是手柄后端时，虚拟手柄用这个独立 id 注册，避免和物理手柄撞名
     static let takeoverId = "AstrisMouse"
@@ -148,31 +166,41 @@ struct AMBindings {
         "KeypadMultiply": 67, "KeypadSubtract": 78, "KeypadAdd": 69, "KeypadDecimal": 65, "KeypadEnter": 76,
     ]
 
-    static func player1(in root: [String: Any]) -> [String: Any]? {
-        guard let players = root["playerInputConfig"] as? [[String: Any]] else { return nil }
-        return players.first(where: { ($0["playerIndex"] as? String) == "Player1" }) ?? players.first
+    struct Player1Location {
+        let playersKey: String
+        let players: [[String: Any]]
+        let index: Int
+        var config: [String: Any] { players[index] }
     }
 
-    static func load(takeoverEnabled: Bool) -> AMBindings {
+    static func locatePlayer1(_ root: [String: Any]) -> Player1Location? {
+        guard let key = root.amKey("playerInputConfig"),
+              let players = root[key] as? [[String: Any]], !players.isEmpty
+        else { return nil }
+        let index = players.firstIndex { ($0[am: "playerIndex"] as? String) == "Player1" } ?? 0
+        return Player1Location(playersKey: key, players: players, index: index)
+    }
+
+    static func loadFromPrefs(takeoverEnabled: Bool) -> AMBindings? {
         guard let data = UserDefaults.standard.data(forKey: "RyujinxOptions"),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            let b = AMBindings()
-            amLog("bindings: RyujinxOptions 不可读，使用默认 controllerId=\"\(b.controllerId)\"，键盘映射为空")
-            return b
-        }
+        else { return nil }
         return parse(root, source: "prefs", takeoverEnabled: takeoverEnabled)
     }
 
-    static func parse(_ root: [String: Any], source: String, takeoverEnabled: Bool) -> AMBindings {
+    static func load(takeoverEnabled: Bool) -> AMBindings {
+        if let b = loadFromPrefs(takeoverEnabled: takeoverEnabled) { return b }
+        let b = AMBindings()
+        amLog("bindings: 偏好里的 RyujinxOptions 不可读，使用默认 controllerId=\"\(b.controllerId)\"，键盘映射为空")
+        return b
+    }
+
+    static func parse(_ root: [String: Any], source: String, takeoverEnabled: Bool) -> AMBindings? {
+        guard let p1 = locatePlayer1(root)?.config else { return nil }
         var b = AMBindings()
-        guard let p1 = player1(in: root) else {
-            amLog("bindings(\(source)): 找不到 playerInputConfig，使用默认 controllerId=\"\(b.controllerId)\"")
-            return b
-        }
         b.source = source
-        b.backend = (p1["backend"] as? String) ?? "missing"
-        let configuredId = (p1["controllerId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        b.backend = (p1[am: "backend"] as? String) ?? "missing"
+        let configuredId = (p1[am: "controllerId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         switch b.backend {
         case "Gamepad" where configuredId != nil:
             b.controllerId = configuredId!
@@ -184,10 +212,10 @@ struct AMBindings {
             b.takeover = takeoverEnabled
             b.controllerId = takeoverEnabled ? AMBindings.takeoverId : (configuredId ?? "Pro Controller")
         }
-        b.useNintendoLayout = (p1["useNintendoLayout"] as? Bool) ?? false
+        b.useNintendoLayout = (p1[am: "useNintendoLayout"] as? Bool) ?? false
 
         func key(_ section: String, _ field: String) -> Int32? {
-            guard let sec = p1[section] as? [String: Any], let name = sec[field] as? String else { return nil }
+            guard let sec = p1[am: section] as? [String: Any], let name = sec[am: field] as? String else { return nil }
             return keyCodes[name]
         }
         func bind(_ section: String, _ field: String, _ button: AMButton) {
@@ -219,16 +247,31 @@ struct AMBindings {
         return b
     }
 
-    // 需要接管时返回改写后的整份配置：Player1 → Gamepad + 虚拟手柄 id，其余字段原样保留
+    // 需要接管时返回改写后的整份配置：Player1 → Gamepad + 虚拟手柄 id，其余字段和键名写法原样保留
     func rewrittenOptions(_ root: [String: Any]) -> [String: Any]? {
-        guard takeover, var players = root["playerInputConfig"] as? [[String: Any]],
-              let idx = players.firstIndex(where: { ($0["playerIndex"] as? String) == "Player1" })
-        else { return nil }
-        players[idx]["backend"] = "Gamepad"
-        players[idx]["controllerId"] = AMBindings.takeoverId
+        guard takeover, let loc = AMBindings.locatePlayer1(root) else { return nil }
+        var players = loc.players
+        var p1 = players[loc.index]
+        let sample = p1.amKey("playerIndex") ?? p1.amKey("controllerType") ?? "backend"
+        p1[p1.amKey("backend") ?? AMBindings.styledKey("backend", like: sample)] = "Gamepad"
+        p1[p1.amKey("controllerId") ?? AMBindings.styledKey("controllerId", like: sample)] = AMBindings.takeoverId
+        players[loc.index] = p1
         var out = root
-        out["playerInputConfig"] = players
+        out[loc.playersKey] = players
         return out
+    }
+
+    // 新增键时沿用同级键的写法：player_index → controller_id，PlayerIndex → ControllerId
+    static func styledKey(_ camel: String, like sample: String) -> String {
+        if sample.contains("_") {
+            return camel.reduce(into: "") { out, ch in
+                if ch.isUppercase { out += "_" + ch.lowercased() } else { out.append(ch) }
+            }
+        }
+        if let first = sample.first, first.isUppercase {
+            return camel.prefix(1).uppercased() + camel.dropFirst()
+        }
+        return camel
     }
 
     var player1Status: String {
@@ -277,6 +320,7 @@ final class AMState {
     var keysDown = Set<Int32>()
     var toggleKeyDown = false
     var connectFailureLogged = false
+    var optionsShapeLogged = false
 
     var frontendRight: (x: Float, y: Float) = (0, 0)
     var samples: [(t: Double, dx: Double, dy: Double)] = []
@@ -347,7 +391,9 @@ func amReleaseVirtualGamepad(reason: String) {
 
 private func amReloadBindings() {
     let s = AMState.shared
-    amApplyBindings(AMBindings.load(takeoverEnabled: s.cfg.takeover))
+    // 偏好暂时不可读时保持现状，不要退回默认值引起虚拟手柄反复拔插
+    guard let fresh = AMBindings.loadFromPrefs(takeoverEnabled: s.cfg.takeover) else { return }
+    amApplyBindings(fresh)
 }
 
 private func amApplyBindings(_ fresh: AMBindings) {
@@ -387,13 +433,28 @@ public func amRewriteOptions(_ json: UnsafePointer<CChar>?) -> UnsafeMutablePoin
         amLog("options: 前端传给 libryujinx 的 JSON 无法解析，原样放行")
         return nil
     }
-    let fresh = AMBindings.parse(root, source: "update_options", takeoverEnabled: s.cfg.takeover)
+    guard let loc = AMBindings.locatePlayer1(root),
+          let fresh = AMBindings.parse(root, source: "update_options", takeoverEnabled: s.cfg.takeover)
+    else {
+        amLog("options: 前端传给 libryujinx 的 JSON 里找不到玩家输入配置，原样放行；顶层键: \(root.keys.sorted().prefix(15).joined(separator: ","))")
+        return nil
+    }
+    s.lock.lock()
+    let firstTime = !s.optionsShapeLogged
+    s.optionsShapeLogged = true
+    s.lock.unlock()
+    if firstTime {
+        amLog("options: libryujinx 收到的 Player1 键名: \(loc.config.keys.sorted().joined(separator: ","))")
+    }
     amApplyBindings(fresh)
     guard let patched = fresh.rewrittenOptions(root),
-          let out = try? JSONSerialization.data(withJSONObject: patched),
+          let out = try? JSONSerialization.data(withJSONObject: patched, options: [.withoutEscapingSlashes]),
           let text = String(data: out, encoding: .utf8)
     else { return nil }
-    if s.cfg.debug { amLog("options: Player1 rewritten (\(data.count) -> \(out.count) bytes)") }
+    if firstTime || s.cfg.debug {
+        let p1 = AMBindings.locatePlayer1(patched)?.config ?? [:]
+        amLog("options: Player1 rewritten (\(data.count) -> \(out.count) bytes): \(p1.amKey("backend") ?? "backend")=\(p1[am: "backend"] ?? "?") \(p1.amKey("controllerId") ?? "controllerId")=\(p1[am: "controllerId"] ?? "?")")
+    }
     return strdup(text)
 }
 
